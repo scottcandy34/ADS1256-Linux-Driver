@@ -4,11 +4,12 @@
 #include <linux/spi/spi.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
-#include <linux/delay.h>  // For usleep_range
-#include <linux/device.h>  // For device APIs, class_find_device
-#include <linux/gpio/consumer.h>  // For GPIO handling
-#include <linux/of.h>            // For device tree parsing
-#include <linux/cdev.h>          // For cdev operations
+#include <linux/delay.h>            // For usleep_range
+#include <linux/device.h>           // For device APIs, class_find_device
+#include <linux/gpio/consumer.h>    // For GPIO handling
+#include <linux/of.h>               // For device tree parsing
+#include <linux/cdev.h>             // For cdev operations
+#include <linux/interrupt.h>        // For DRDY interupt handling
 
 // Define constants
 #define ADS1256_NAME "ads1256"
@@ -109,18 +110,60 @@
 #define ADS1256_IO_DIR1_IN		0x20  // DIR1 - Digital I/O Direction for Pin D1
 #define ADS1256_IO_DIR0_IN		0x10  // DIR0 - Digital I/O Direction for Pin D0/CLKOUT
 
-// Default Configuration Values
-#define ADS1256_MUX_DEFAULT         0x01  // Select AIN0 (channel 0) as input
-#define ADS1256_ADCON_DEFAULT       0x20  // PGA = 1 (gain 1), clock = internal
-#define ADS1256_DRATE_DEFAULT       0x03  // Data rate = 30 SPS (samples per second)
+// Reset Configuration Values
+#define ADS1256_MUX_RESET         0x01
+#define ADS1256_ADCON_RESET       0x20
+#define ADS1256_DRATE_RESET       0xF0
+#define ADS1256_STATUS_RESET      0x01
+#define ADS1256_IO_RESET          0xE0
+
+static int data_rate = ADS1256_DRATE_SPS_30000;
+static int pga_gain = ADS1256_ADCON_PGA_1;
+module_param(data_rate, int, 0644);
+module_param(pga_gain, int, 0644);
+MODULE_PARM_DESC(data_rate, "ADS1256 data rate (default: 0xF0 = 30,000 SPS)");
+MODULE_PARM_DESC(pga_gain, "ADS1256 PGA gain (default: 0x00 = 1)");
+
+static bool is_valid_drate(int drate) {
+    switch (drate) {
+    case ADS1256_DRATE_SPS_30000:
+    case ADS1256_DRATE_SPS_15000:
+    case ADS1256_DRATE_SPS_7500:
+    case ADS1256_DRATE_SPS_3750:
+    case ADS1256_DRATE_SPS_2000:
+    case ADS1256_DRATE_SPS_1000:
+    case ADS1256_DRATE_SPS_500:
+    case ADS1256_DRATE_SPS_100:
+    case ADS1256_DRATE_SPS_60:
+    case ADS1256_DRATE_SPS_50:
+    case ADS1256_DRATE_SPS_30:
+    case ADS1256_DRATE_SPS_25:
+    case ADS1256_DRATE_SPS_15:
+    case ADS1256_DRATE_SPS_10:
+    case ADS1256_DRATE_SPS_5:
+    case ADS1256_DRATE_SPS_2d5:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool is_valid_pga(int pga) {
+    return pga >= ADS1256_ADCON_PGA_1 && pga <= ADS1256_ADCON_PGA_64;
+}
 
 // Driver data structure
 struct ads1256_data {
     struct spi_device *spi;
     struct mutex lock;
-    struct gpio_desc *drdy_gpio;  // GPIO descriptor for DRDY (keeping this)
+    struct gpio_desc *drdy_gpio;
     u8 tx_buf[4];
     u8 rx_buf[4];
+    wait_queue_head_t wait;
+    bool data_ready;
+    int irq;
+    bool sysfs_last_sample;
+    bool sysfs_calibrate;
 };
 
 static int ads1256_major;
@@ -209,21 +252,21 @@ static int ads1256_configure(struct ads1256_data *data) {
     }
 
     // Set MUX (AIN0 as input, AINCOM as reference)
-    ret = ads1256_write_reg(data, ADS1256_REG_MUX, ADS1256_MUX_DEFAULT);
+    ret = ads1256_write_reg(data, ADS1256_REG_MUX, ADS1256_MUX_RESET);
     if (ret) {
         dev_err(&data->spi->dev, "Failed to set MUX: %d\n", ret);
         goto out;
     }
 
-    // Set ADCON (PGA = 1, internal clock)
-    ret = ads1256_write_reg(data, ADS1256_REG_ADCON, ADS1256_ADCON_DEFAULT);
+    // Set ADCON
+    ret = ads1256_write_reg(data, ADS1256_REG_ADCON, pga_gain);
     if (ret) {
         dev_err(&data->spi->dev, "Failed to set ADCON: %d\n", ret);
         goto out;
     }
 
-    // Set DRATE (30 SPS)
-    ret = ads1256_write_reg(data, ADS1256_REG_DRATE, ADS1256_DRATE_DEFAULT);
+    // Set DRATE
+    ret = ads1256_write_reg(data, ADS1256_REG_DRATE, data_rate);
     if (ret) {
         dev_err(&data->spi->dev, "Failed to set DRATE: %d\n", ret);
         goto out;
@@ -246,15 +289,46 @@ out:
     return ret;
 }
 
+static int ads1256_get_timeout_us(int drate) {
+    switch (drate) {
+    case ADS1256_DRATE_SPS_30000: return 33;    // 33 us
+    case ADS1256_DRATE_SPS_15000: return 67;    // 67 us
+    case ADS1256_DRATE_SPS_7500:  return 133;   // 133 us
+    case ADS1256_DRATE_SPS_3750:  return 267;   // 267 us
+    case ADS1256_DRATE_SPS_2000:  return 500;   // 500 us
+    case ADS1256_DRATE_SPS_1000:  return 1000;  // 1 ms
+    case ADS1256_DRATE_SPS_500:   return 2000;  // 2 ms
+    case ADS1256_DRATE_SPS_100:   return 10000; // 10 ms
+    case ADS1256_DRATE_SPS_60:    return 16667; // 16.667 ms
+    case ADS1256_DRATE_SPS_50:    return 20000; // 20 ms
+    case ADS1256_DRATE_SPS_30:    return 33333; // 33.333 ms
+    case ADS1256_DRATE_SPS_25:    return 40000; // 40 ms
+    case ADS1256_DRATE_SPS_15:    return 66667; // 66.667 ms
+    case ADS1256_DRATE_SPS_10:    return 100000;// 100 ms
+    case ADS1256_DRATE_SPS_5:     return 200000;// 200 ms
+    case ADS1256_DRATE_SPS_2d5:   return 400000;// 400 ms
+    default: return ADS1256_DRDY_TIMEOUT;
+    }
+}
+
 // Read one sample from channel 0, with DRDY polling
 static int ads1256_read_sample(struct ads1256_data *data, u32 *value) {
     int ret;
-    int timeout = ADS1256_DRDY_TIMEOUT / 1000;  // Convert to iterations (33 iterations at 1 ms)
+    int timeout = ads1256_get_timeout_us(data_rate) / 1000 + 1;  // Convert to ms iterations, add 1 for margin
     u8 rdata_cmd = ADS1256_CMD_RDATA;
 
     mutex_lock(&data->lock);
     // Poll DRDY (active-low, so wait for it to go low)
-    if (data->drdy_gpio) {
+    if (data->irq >= 0) {
+        data->data_ready = false;  // Reset before waiting
+        ret = wait_event_interruptible_timeout(data->wait, data->data_ready,
+                                               usecs_to_jiffies(ads1256_get_timeout_us(data_rate)));
+        if (ret <= 0) {
+            dev_err(&data->spi->dev, "DRDY interrupt timeout or signal\n");
+            ret = ret ? : -ETIMEDOUT;
+            goto out;
+        }
+    } else if (data->drdy_gpio) {
         while (gpiod_get_value_cansleep(data->drdy_gpio) && timeout--) {
             usleep_range(1000, 2000);
         }
@@ -264,13 +338,13 @@ static int ads1256_read_sample(struct ads1256_data *data, u32 *value) {
             goto out;
         }
     } else {
-        usleep_range(ADS1256_DRDY_TIMEOUT, ADS1256_DRDY_TIMEOUT + 1000);  // Fixed delay
+        usleep_range(ads1256_get_timeout_us(data_rate), ads1256_get_timeout_us(data_rate) + 1000);
         dev_dbg(&data->spi->dev, "No DRDY GPIO, using fixed delay\n");
     }
     dev_dbg(&data->spi->dev, "DRDY asserted, proceeding to read\n");
 
     // Send RDATA command
-    dev_dbg(&data->spi->dev, "Sending RDATA command, TX buffer: 0x%02x\n", data->tx_buf[0]);
+    dev_dbg(&data->spi->dev, "Sending RDATA command: 0x%02x\n", rdata_cmd);
     ret = ads1256_spi_transfer(data, &rdata_cmd, NULL, 1);
     if (ret) {
         dev_err(&data->spi->dev, "Failed to send RDATA: %d\n", ret);
@@ -374,9 +448,9 @@ static int ads1256_open(struct inode *inode, struct file *filp) {
         }
     }
 
-    // Verify SPI and DRDY GPIO are valid before proceeding
-    if (!data->spi || !data->drdy_gpio) {
-        pr_err("Invalid driver data: spi=%p, drdy_gpio=%p\n", data->spi, data->drdy_gpio);
+    // Verify SPI is valid before proceeding
+    if (!data->spi) {  // Only SPI is truly required
+        pr_err("Invalid driver data: spi=%p\n", data->spi);
         return -ENODEV;
     }
 
@@ -402,6 +476,31 @@ static ssize_t last_sample_show(struct device *dev, struct device_attribute *att
 }
 static DEVICE_ATTR_RO(last_sample);
 
+static irqreturn_t ads1256_drdy_handler(int irq, void *dev_id) {
+    struct ads1256_data *data = dev_id;
+    data->data_ready = true;
+    wake_up_interruptible(&data->wait);
+    return IRQ_HANDLED;
+}
+
+static ssize_t calibrate_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
+    struct ads1256_data *data = dev_get_drvdata(dev);
+    u8 selfcal_cmd = ADS1256_CMD_SELFCAL;
+    int ret;
+
+    mutex_lock(&data->lock);
+    ret = ads1256_spi_transfer(data, &selfcal_cmd, NULL, 1);
+    if (ret) {
+        dev_err(&data->spi->dev, "Calibration failed: %d\n", ret);
+    } else {
+        usleep_range(500, 1000);
+        dev_info(&data->spi->dev, "Calibration triggered\n");
+    }
+    mutex_unlock(&data->lock);
+    return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(calibrate);
+
 static int ads1256_probe(struct spi_device *spi) {
     struct ads1256_data *data;
     int ret;
@@ -426,11 +525,25 @@ static int ads1256_probe(struct spi_device *spi) {
         data->drdy_gpio = NULL;
     }
     dev_info(&spi->dev, "DRDY GPIO retrieved: %p\n", data->drdy_gpio);
+    data->irq = -1;  // Default to no IRQ
+    init_waitqueue_head(&data->wait);  // Initialize unconditionally
+    if (!IS_ERR(data->drdy_gpio)) {
+        data->irq = gpiod_to_irq(data->drdy_gpio);
+        if (data->irq >= 0) {
+            ret = request_irq(data->irq, ads1256_drdy_handler, IRQF_TRIGGER_FALLING, "ads1256_drdy", data);
+            if (ret) {
+                dev_warn(&spi->dev, "Failed to request IRQ: %d, falling back to polling\n", ret);
+                data->irq = -1;
+            } else {
+                dev_info(&spi->dev, "Using DRDY IRQ: %d\n", data->irq);
+            }
+        }
+    }
 
     // Force SPI mode 1 (CPOL=0, CPHA=1) as per ADS1256 datasheet
     spi->mode = SPI_MODE_1;
     spi->bits_per_word = 8;
-    spi->max_speed_hz = 1920000;  // 1.92 MHz max per ADS1256 datasheet
+    spi->max_speed_hz = 2500000;  // 1.92 MHz max per ADS1256 datasheet
 
     dev_info(&spi->dev, "Attempting SPI setup with mode %d, bits_per_word %d, max_speed_hz %d\n",
              spi->mode, spi->bits_per_word, spi->max_speed_hz);
@@ -506,8 +619,18 @@ static int ads1256_probe(struct spi_device *spi) {
     dev_info(&spi->dev, "Device created: %p, major=%d, minor=0\n", ads1256_device, ads1256_major);
 
     ret = device_create_file(ads1256_device, &dev_attr_last_sample);
-    if (ret)
-        dev_warn(&spi->dev, "Failed to create sysfs file: %d\n", ret);
+    if (ret) {
+        dev_warn(&spi->dev, "Failed to create last_sample sysfs file: %d\n", ret);
+    } else {
+        data->sysfs_last_sample = true;
+    }
+
+    ret = device_create_file(ads1256_device, &dev_attr_calibrate);
+    if (ret) {
+        dev_warn(&spi->dev, "Failed to create calibrate sysfs file: %d\n", ret);
+    } else {
+        data->sysfs_calibrate = true;
+    }
 
     // Store the driver data in the device for later retrieval
     dev_set_drvdata(ads1256_device, data);
@@ -538,25 +661,27 @@ err_del_cdev:
 err_unreg_chrdev:
     unregister_chrdev(ads1256_major, ADS1256_NAME);
 err_put_drdy:
-    if (data->drdy_gpio)
-        gpiod_put(data->drdy_gpio);
     return ret;
 }
 
 // SPI remove function
 static int ads1256_remove(struct spi_device *spi) {
     struct ads1256_data *data = spi_get_drvdata(spi);
-
     if (data) {
-        gpiod_put(data->drdy_gpio);  // Release DRDY GPIO
+        if (data->irq >= 0)
+            free_irq(data->irq, data);
+        if (data->sysfs_last_sample)
+            device_remove_file(ads1256_device, &dev_attr_last_sample);
+        if (data->sysfs_calibrate)
+            device_remove_file(ads1256_device, &dev_attr_calibrate);
         device_destroy(ads1256_class, MKDEV(ads1256_major, 0));
         class_destroy(ads1256_class);
-        cdev_del(&ads1256_cdev);  // Clean up cdev
+        cdev_del(&ads1256_cdev);
         unregister_chrdev(ads1256_major, ADS1256_NAME);
     }
     spi_set_drvdata(spi, NULL);
-	dev_info(&spi->dev, "ADS1256 removed\n");
-    return 0;  // Return an int to match the spi_driver.remove signature
+    dev_info(&spi->dev, "ADS1256 removed\n");
+    return 0;
 }
 
 static const struct spi_device_id ads1256_id[] = {
@@ -583,6 +708,14 @@ static struct spi_driver ads1256_driver = {
 };
 
 static int __init ads1256_init(void) {
+    if (!is_valid_drate(data_rate)) {
+        pr_err("Invalid data_rate: 0x%x, using default 0x%x\n", data_rate, ADS1256_DRATE_SPS_30000);
+        data_rate = ADS1256_DRATE_SPS_30000;
+    }
+    if (!is_valid_pga(pga_gain)) {
+        pr_err("Invalid pga_gain: 0x%x, using default 0x%x\n", pga_gain, ADS1256_ADCON_PGA_1);
+        pga_gain = ADS1256_ADCON_PGA_1;
+    }
     return spi_register_driver(&ads1256_driver);
 }
 
