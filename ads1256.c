@@ -1537,5 +1537,5 @@ module_init(ads1256_init);
 module_exit(ads1256_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Brandon Zimmerman - zimmermanbs@gcc.edu");
+MODULE_AUTHOR("Scottcandy34");
 MODULE_DESCRIPTION("Basic ADS1256 ADC Driver Relying on SPI Controller CS");
