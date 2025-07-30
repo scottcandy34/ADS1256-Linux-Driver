@@ -136,6 +136,8 @@ static int buffer_size = ADS1256_BUFFER_SIZE;
 module_param(buffer_size, int, 0644);
 MODULE_PARM_DESC(buffer_size, "Size of the sample buffer in samples (default 1024)");
 
+static atomic_t ads1256_ref_count = ATOMIC_INIT(0);
+static DEFINE_SPINLOCK(ref_count_lock);  // Protect ref_count operations
 static atomic_t ads1256_device_count = ATOMIC_INIT(0);
 static struct ads1256_data *ads1256_devices[MAX_ADS1256_DEVICES];
 static DEFINE_SPINLOCK(device_list_lock);
@@ -597,7 +599,9 @@ static ssize_t ads1256_read(struct file *filp, char __user *buf, size_t count, l
     struct ads1256_data *data = filp->private_data;
     size_t num_samples = count / sizeof(struct ads1256_mux_sample);
     struct ads1256_mux_sample *samples_buf;
-    size_t i, to_read;
+    struct ads1256_mux_sample *ordered_buf;
+    size_t i, to_read, cycle_size, newest_head, start_idx, offset;
+    ssize_t ret;
 
     if (count % sizeof(struct ads1256_mux_sample) || num_samples == 0) {
         dev_err(&data->spi->dev, "Invalid read count: %zu, must be multiple of %zu\n",
@@ -609,12 +613,21 @@ static ssize_t ads1256_read(struct file *filp, char __user *buf, size_t count, l
     if (!data->buffering_enabled) {
         mutex_unlock(&data->lock);  // Unlock before recursive call
         // Fall back to original synchronous read if buffering is off
+        dev_dbg(&data->spi->dev, "Buffering off, falling back to sync read\n");
         return ads1256_read_sync(filp, buf, count, f_pos);  // Call synchronous helper
     }
 
-    if (data->buffer_count == 0) {
+    cycle_size = data->num_samples > 0 ? data->num_samples : 1;
+    if (num_samples != cycle_size) {
         mutex_unlock(&data->lock);
-        return -EAGAIN;  // Non-blocking, let user poll
+        dev_err(&data->spi->dev, "Requested %zu samples, but cycle size is %zu\n", num_samples, cycle_size);
+        return -EINVAL;  // Enforce reading exactly one cycle
+    }
+
+    if (data->buffer_count < cycle_size) {
+        mutex_unlock(&data->lock);
+        dev_info(&data->spi->dev, "Not enough samples: %zu < %zu\n", data->buffer_count, cycle_size);
+        return -EAGAIN;  // Wait until a full cycle is available
     }
 
     samples_buf = kmalloc_array(num_samples, sizeof(struct ads1256_mux_sample), GFP_KERNEL);
@@ -624,23 +637,58 @@ static ssize_t ads1256_read(struct file *filp, char __user *buf, size_t count, l
         return -ENOMEM;
     }
 
-    to_read = min(num_samples, data->buffer_count);
+    // Calculate the starting index of the most recent complete cycle
+    newest_head = (data->buffer_head == 0) ? data->buffer_size - 1 : data->buffer_head - 1;
+    start_idx = (newest_head >= cycle_size - 1) ? newest_head - (cycle_size - 1) :
+                data->buffer_size - (cycle_size - newest_head - 1);
+
+    // Copy the last cycle of samples in buffer order
+    to_read = cycle_size;
     for (i = 0; i < to_read; i++) {
-        samples_buf[i] = data->sample_buffer[data->buffer_tail];
-        data->buffer_tail = (data->buffer_tail + 1) % data->buffer_size;
-        data->buffer_count--;
+        size_t idx = (start_idx + i) % data->buffer_size;
+        samples_buf[i] = data->sample_buffer[idx];
     }
+
+    // Reorder samples to match the original MUX config order
+    // Find the offset where the newest sample's MUX config aligns with data->mux_samples
+    offset = 0;
+    for (i = 0; i < cycle_size; i++) {
+        if (samples_buf[to_read - 1].mux_config == data->mux_samples[i].mux_config) {
+            offset = i + 1;  // Start from the next expected MUX config
+            break;
+        }
+    }
+
+    ordered_buf = kmalloc_array(to_read, sizeof(struct ads1256_mux_sample), GFP_KERNEL);
+    if (!ordered_buf) {
+        kfree(samples_buf);
+        dev_err(&data->spi->dev, "Failed to allocate ordered buffer\n");
+        mutex_unlock(&data->lock);
+        return -ENOMEM;
+    }
+
+    for (i = 0; i < to_read; i++) {
+        size_t orig_idx = (offset + i) % cycle_size;
+        size_t buf_idx = to_read - 1 - ((cycle_size - offset + i) % cycle_size);
+        ordered_buf[i] = samples_buf[buf_idx];
+        dev_dbg(&data->spi->dev, "Reordered: orig_idx=%zu, buf_idx=%zu, MUX=0x%02x\n",
+                orig_idx, buf_idx, ordered_buf[i].mux_config);
+    }
+
     mutex_unlock(&data->lock);
 
-    if (copy_to_user(buf, samples_buf, to_read * sizeof(struct ads1256_mux_sample))) {
+     if (copy_to_user(buf, ordered_buf, to_read * sizeof(struct ads1256_mux_sample))) {  // Use ordered_buf
         kfree(samples_buf);
+        kfree(ordered_buf);
         dev_err(&data->spi->dev, "Failed to copy %zu samples to user space\n", to_read);
         return -EFAULT;
     }
 
     kfree(samples_buf);
+    kfree(ordered_buf);
     printk_ratelimited(KERN_DEBUG "%s: Read %zu buffered samples\n", dev_name(&data->spi->dev), to_read);
-    return to_read * sizeof(struct ads1256_mux_sample);
+    ret = to_read * sizeof(struct ads1256_mux_sample);
+    return ret;
 }
 
 static int ads1256_open(struct inode *inode, struct file *filp) {
@@ -829,14 +877,17 @@ static void ads1256_sample_work(struct work_struct *work) {
     ret = ads1256_read_sample(data, &sample);
     if (ret == 0) {
         mutex_lock(&data->lock);
+        // Always add the new sample, overwriting oldest if full
+        data->sample_buffer[data->buffer_head] = sample;
+        data->buffer_head = (data->buffer_head + 1) % data->buffer_size;
         if (data->buffer_count < data->buffer_size) {
-            data->sample_buffer[data->buffer_head] = sample;
-            data->buffer_head = (data->buffer_head + 1) % data->buffer_size;
             data->buffer_count++;
-            wake_up_interruptible(&data->wait);
         } else {
+            data->buffer_tail = (data->buffer_tail + 1) % data->buffer_size;  // Overwrite oldest
             atomic_inc(&data->dropped_samples);
+            printk_ratelimited(KERN_WARNING "%s: Buffer full, oldest sample dropped\n", dev_name(&data->spi->dev));
         }
+        wake_up_interruptible(&data->wait);
         mutex_unlock(&data->lock);
         usleep_range(ads1256_get_timeout_us(data) - 10, ads1256_get_timeout_us(data));  // Match sample rate
         schedule_work(&data->sample_work);
@@ -1144,6 +1195,9 @@ static int ads1256_probe(struct spi_device *spi) {
         }
     }
     data->sync_gpio = shared_sync_gpio;  // Assign shared GPIO to this instance
+    if (!data->sync_gpio) {
+        dev_warn(&spi->dev, "Shared sync GPIO not available, synchronization disabled\n");
+    }
     mutex_unlock(&sync_mutex);
 
     // Reset GPIO setup (optional)
@@ -1177,9 +1231,11 @@ static int ads1256_probe(struct spi_device *spi) {
 
 	/* Register Character Device */
     // Register character device (one per SPI device)
+    spin_lock(&ref_count_lock);
     if (!ads1256_major) {
         ret = register_chrdev(0, ADS1256_NAME, &ads1256_fops);
         if (ret < 0) {
+            spin_unlock(&ref_count_lock);
             dev_err(&spi->dev, "Failed to register chrdev: %d\n", ret);
             return ret;
         }
@@ -1190,11 +1246,15 @@ static int ads1256_probe(struct spi_device *spi) {
         if (IS_ERR(ads1256_class)) {
             ret = PTR_ERR(ads1256_class);
             unregister_chrdev(ads1256_major, ADS1256_NAME);
+            ads1256_major = 0;
+            spin_unlock(&ref_count_lock);
             dev_err(&spi->dev, "Failed to create class: %d\n", ret);
             return ret;
         }
         dev_info(&spi->dev, "Class created: %p\n", ads1256_class);
     }
+    atomic_inc(&ads1256_ref_count);
+    spin_unlock(&ref_count_lock);
 
     // Assign unique minor number
     spin_lock(&device_list_lock);
@@ -1321,37 +1381,33 @@ err_init:
 err_device:
     cdev_del(&data->cdev);
 err_cdev:
-    if (bus_num == 0) {  // Only cleanup class/major on first failure
-        class_destroy(ads1256_class);
-        unregister_chrdev(ads1256_major, ADS1256_NAME);
-        ads1256_class = NULL;
-        ads1256_major = 0;
-    }
+    spin_lock(&ref_count_lock);
+    atomic_dec(&ads1256_ref_count);  // Undo the increment if we fail
+    spin_unlock(&ref_count_lock);
     return ret;
 }
 
 // SPI remove function
 static int ads1256_remove(struct spi_device *spi) {
     struct ads1256_data *data = spi_get_drvdata(spi);
-    int device_index;
+    // int device_index;
+    int device_index = -1;
 
     if (data) {
+        // Cancel work and free resources
         cancel_work_sync(&data->sample_work);  // Stop workqueue
         mutex_lock(&data->lock);
         kfree(data->sample_buffer);            // Free buffer
         data->sample_buffer = NULL;
+        kfree(data->mux_samples);
+        data->mux_samples = NULL;
+        data->num_samples = 0;
         mutex_unlock(&data->lock);
 
         if (data->irq >= 0) {
             free_irq(data->irq, data);
             data->irq = -1;  // Prevent double-free attempts
         }
-
-        mutex_lock(&data->lock);
-        kfree(data->mux_samples);
-        data->mux_samples = NULL;
-        data->num_samples = 0;
-        mutex_unlock(&data->lock);
 
         // Only remove sysfs files and device if they were created
         if (data->device) {
@@ -1369,6 +1425,8 @@ static int ads1256_remove(struct spi_device *spi) {
         }
 
         cdev_del(&data->cdev);
+        data->sync_gpio = NULL;  // Clear reference in this instance
+
 
         // Remove from device list
         spin_lock(&device_list_lock);
@@ -1388,6 +1446,11 @@ static int ads1256_remove(struct spi_device *spi) {
             cancel_delayed_work_sync(&sync_work);  // Cancel timeout if no devices remain
         }
         spin_unlock(&device_list_lock);
+
+        // Decrement reference count safely
+        spin_lock(&ref_count_lock);
+        atomic_dec(&ads1256_ref_count);
+        spin_unlock(&ref_count_lock);
 
         dev_info(&spi->dev, "ADS1256 on SPI%d CS%d removed\n", data->bus_num, data->cs_num);
     }
@@ -1419,14 +1482,54 @@ static struct spi_driver ads1256_driver = {
 };
 
 static int __init ads1256_init(void) {
-    return spi_register_driver(&ads1256_driver);
+    int ret;
+
+    // Request the shared sync GPIO at module init
+    shared_sync_gpio = gpiod_get(NULL, "sync", GPIOD_OUT_HIGH);
+    if (IS_ERR(shared_sync_gpio)) {
+        ret = PTR_ERR(shared_sync_gpio);
+        pr_warn("ADS1256: Failed to get shared sync GPIO: %d, synchronization disabled\n", ret);
+        shared_sync_gpio = NULL;
+    } else {
+        pr_info("ADS1256: Shared sync GPIO initialized\n");
+        INIT_DELAYED_WORK(&sync_work, ads1256_sync_work_handler);
+    }
+
+    ret = spi_register_driver(&ads1256_driver);
+    if (ret) {
+        if (shared_sync_gpio) {
+            gpiod_put(shared_sync_gpio);
+            shared_sync_gpio = NULL;
+        }
+    }
+    return ret;
 }
 
 static void __exit ads1256_exit(void) {
     spi_unregister_driver(&ads1256_driver);
-    if (ads1256_class) {
+
+    // Cleanup class and chrdev only if all devices are gone
+    spin_lock(&ref_count_lock);
+    if (atomic_read(&ads1256_ref_count) == 0 && ads1256_class) {
         class_destroy(ads1256_class);
-        unregister_chrdev(ads1256_major, ADS1256_NAME);
+        ads1256_class = NULL;
+        if (ads1256_major) {
+            unregister_chrdev(ads1256_major, ADS1256_NAME);
+            ads1256_major = 0;
+        }
+        pr_info("ADS1256: Class and chrdev unregistered\n");
+    } else if (atomic_read(&ads1256_ref_count) != 0) {
+        pr_warn("ADS1256: %d devices still active, deferring class cleanup\n", 
+                atomic_read(&ads1256_ref_count));
+    }
+    spin_unlock(&ref_count_lock);
+
+    // Release shared sync GPIO
+    if (shared_sync_gpio) {
+        cancel_delayed_work_sync(&sync_work);  // Ensure no pending work
+        gpiod_put(shared_sync_gpio);
+        shared_sync_gpio = NULL;
+        pr_info("ADS1256: Shared sync GPIO released\n");
     }
 }
 
@@ -1434,5 +1537,5 @@ module_init(ads1256_init);
 module_exit(ads1256_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Your Name");
+MODULE_AUTHOR("Brandon Zimmerman - zimmermanbs@gcc.edu");
 MODULE_DESCRIPTION("Basic ADS1256 ADC Driver Relying on SPI Controller CS");
