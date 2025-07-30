@@ -15,12 +15,14 @@
 #include <linux/workqueue.h>
 #include <linux/poll.h>
 #include <linux/slab.h>
+#include <linux/ratelimit.h>
 
 // Define constants
 #define ADS1256_NAME "ads1256"
 #define ADS1256_DRDY_TIMEOUT 33000  // microseconds (33 ms for 30 SPS)
 #define MAX_ADS1256_DEVICES 5  // SPI0, SPI3, SPI4, SPI5, SPI6
 #define SYNC_TIMEOUT_MS 5000  // 5 seconds timeout
+#define ADS1256_BUFFER_SIZE 1024  // Adjustable size
 
 // ADS1256 Commands (see p34)
 #define ADS1256_CMD_WAKEUP	    0x00  // Completes SYNC and Exits Standby Mode 0000  0000 (00h)
@@ -128,6 +130,11 @@
 #define ADS1256_SET_DATA_RATE _IOW(ADS1256_IOC_MAGIC, 1, int)
 #define ADS1256_SET_PGA_GAIN  _IOW(ADS1256_IOC_MAGIC, 2, int)
 #define ADS1256_SET_SENSOR_DETECT _IOW(ADS1256_IOC_MAGIC, 4, int)
+#define ADS1256_SET_BUFFERING _IOW(ADS1256_IOC_MAGIC, 7, int)
+
+static int buffer_size = ADS1256_BUFFER_SIZE;
+module_param(buffer_size, int, 0644);
+MODULE_PARM_DESC(buffer_size, "Size of the sample buffer in samples (default 1024)");
 
 static atomic_t ads1256_device_count = ATOMIC_INIT(0);
 static struct ads1256_data *ads1256_devices[MAX_ADS1256_DEVICES];
@@ -192,8 +199,8 @@ struct ads1256_data {
     struct spi_device *spi;
     struct mutex lock;
     struct gpio_desc *drdy_gpio;
-    struct gpio_desc *sync_gpio;  // Shared sync GPIO
-    struct gpio_desc *reset_gpio;  // New field for reset pin
+    struct gpio_desc *sync_gpio;                // Shared sync GPIO
+    struct gpio_desc *reset_gpio;               // New field for reset pin
     u8 tx_buf[4];
     u8 rx_buf[4];
     wait_queue_head_t wait;
@@ -205,14 +212,21 @@ struct ads1256_data {
     size_t num_samples;
     bool sampling_active;
     struct ads1256_mux_sample last_sample;
-    struct cdev cdev;           // Per-device cdev
-    struct device *device;      // Per-device device pointer
-    int bus_num;    // SPI bus number (0, 3, 4, 5, 6)
-    int cs_num;     // Chip select number (e.g., 0, 1, 2)
-    int dev_minor;  // Unique minor number for device
-    dev_t devt;                 // Device number (major + minor)
-    int data_rate;  // Per-device data rate
-    int pga_gain;   // Per-device PGA gain
+    struct cdev cdev;                           // Per-device cdev
+    struct device *device;                      // Per-device device pointer
+    int bus_num;                                // SPI bus number (0, 3, 4, 5, 6)
+    int cs_num;                                 // Chip select number (e.g., 0, 1, 2)
+    int dev_minor;                              // Unique minor number for device
+    dev_t devt;                                 // Device number (major + minor)
+    int data_rate;                              // Per-device data rate
+    int pga_gain;                               // Per-device PGA gain
+    size_t buffer_size;
+    struct ads1256_mux_sample *sample_buffer;   // Circular buffer
+    size_t buffer_head, buffer_tail;            // Indices
+    size_t buffer_count;                        // Number of samples in buffer
+    struct work_struct sample_work;             // Workqueue for sampling
+    bool buffering_enabled;                     // Control flag for enabling/disabling
+    atomic_t dropped_samples;
 };
 
 static struct class *ads1256_class;  // Single class for all devices
@@ -504,7 +518,7 @@ static ssize_t ads1256_write(struct file *filp, const char __user *buf, size_t c
     return count;
 }
 
-static ssize_t ads1256_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos) {
+static ssize_t ads1256_read_sync(struct file *filp, char __user *buf, size_t count, loff_t *f_pos) {
     struct ads1256_data *data = filp->private_data;
     size_t num_samples = count / sizeof(struct ads1256_mux_sample);
     struct ads1256_mux_sample *samples_buf;
@@ -524,12 +538,12 @@ static ssize_t ads1256_read(struct file *filp, char __user *buf, size_t count, l
         return -EINVAL;
     }
     if (num_samples > data->num_samples) {
-        num_samples = data->num_samples;  // Limit to stored configs
+        num_samples = data->num_samples;
         count = num_samples * sizeof(struct ads1256_mux_sample);
     }
-    data->sampling_active = true;  // Set flag
+    data->sampling_active = true;
 
-    samples_buf = kmalloc(count, GFP_KERNEL);
+    samples_buf = kmalloc_array(num_samples, sizeof(struct ads1256_mux_sample), GFP_KERNEL);
     if (!samples_buf) {
         dev_err(&data->spi->dev, "Failed to allocate buffer for %zu samples\n", num_samples);
         data->sampling_active = false;
@@ -537,7 +551,6 @@ static ssize_t ads1256_read(struct file *filp, char __user *buf, size_t count, l
         return -ENOMEM;
     }
 
-    // Copy all mux_configs at once
     for (i = 0; i < num_samples; i++) {
         samples_buf[i].mux_config = data->mux_samples[i].mux_config;
     }
@@ -574,10 +587,60 @@ static ssize_t ads1256_read(struct file *filp, char __user *buf, size_t count, l
 
     kfree(samples_buf);
     mutex_lock(&data->lock);
-    data->sampling_active = false;  // Clear flag
+    data->sampling_active = false;
     mutex_unlock(&data->lock);
     dev_dbg(&data->spi->dev, "Successfully read %zu samples to user space\n", num_samples);
     return count;
+}
+
+static ssize_t ads1256_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos) {
+    struct ads1256_data *data = filp->private_data;
+    size_t num_samples = count / sizeof(struct ads1256_mux_sample);
+    struct ads1256_mux_sample *samples_buf;
+    size_t i, to_read;
+
+    if (count % sizeof(struct ads1256_mux_sample) || num_samples == 0) {
+        dev_err(&data->spi->dev, "Invalid read count: %zu, must be multiple of %zu\n",
+                count, sizeof(struct ads1256_mux_sample));
+        return -EINVAL;
+    }
+
+    mutex_lock(&data->lock);
+    if (!data->buffering_enabled) {
+        mutex_unlock(&data->lock);  // Unlock before recursive call
+        // Fall back to original synchronous read if buffering is off
+        return ads1256_read_sync(filp, buf, count, f_pos);  // Call synchronous helper
+    }
+
+    if (data->buffer_count == 0) {
+        mutex_unlock(&data->lock);
+        return -EAGAIN;  // Non-blocking, let user poll
+    }
+
+    samples_buf = kmalloc_array(num_samples, sizeof(struct ads1256_mux_sample), GFP_KERNEL);
+    if (!samples_buf) {
+        dev_err(&data->spi->dev, "Failed to allocate buffer for %zu samples\n", num_samples);
+        mutex_unlock(&data->lock);
+        return -ENOMEM;
+    }
+
+    to_read = min(num_samples, data->buffer_count);
+    for (i = 0; i < to_read; i++) {
+        samples_buf[i] = data->sample_buffer[data->buffer_tail];
+        data->buffer_tail = (data->buffer_tail + 1) % data->buffer_size;
+        data->buffer_count--;
+    }
+    mutex_unlock(&data->lock);
+
+    if (copy_to_user(buf, samples_buf, to_read * sizeof(struct ads1256_mux_sample))) {
+        kfree(samples_buf);
+        dev_err(&data->spi->dev, "Failed to copy %zu samples to user space\n", to_read);
+        return -EFAULT;
+    }
+
+    kfree(samples_buf);
+    printk_ratelimited(KERN_DEBUG "%s: Read %zu buffered samples\n", dev_name(&data->spi->dev), to_read);
+    return to_read * sizeof(struct ads1256_mux_sample);
 }
 
 static int ads1256_open(struct inode *inode, struct file *filp) {
@@ -679,6 +742,28 @@ static long ads1256_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
             dev_info(&data->spi->dev, "Sensor detect set to 0x%x\n", sdcs);
             break;
 
+        case ADS1256_SET_BUFFERING:
+            int enable;
+            if (copy_from_user(&enable, (int __user *)arg, sizeof(enable))) {
+                mutex_unlock(&data->lock);
+                return -EFAULT;
+            }
+            if (enable != 0 && enable != 1) {
+                mutex_unlock(&data->lock);
+                return -EINVAL;
+            }
+            if (data->sampling_active && enable != data->buffering_enabled) {
+                mutex_unlock(&data->lock);
+                return -EBUSY;
+            }
+            data->buffering_enabled = enable;
+            if (enable) {
+                schedule_work(&data->sample_work);
+            } else {
+                cancel_work_sync(&data->sample_work);
+            }
+            break;
+            
         default:
             mutex_unlock(&data->lock);
             return -ENOTTY;
@@ -700,8 +785,11 @@ static unsigned int ads1256_poll(struct file *filp, struct poll_table_struct *wa
 
     mutex_lock(&data->lock);
     poll_wait(filp, &data->wait, wait);
-    if (data->data_ready)
+    if (data->buffering_enabled && data->buffer_count > 0) {
         mask |= POLLIN | POLLRDNORM;
+    } else if (!data->buffering_enabled && data->data_ready) {
+        mask |= POLLIN | POLLRDNORM;
+    }
     mutex_unlock(&data->lock);
     return mask;
 }
@@ -721,6 +809,41 @@ static irqreturn_t ads1256_drdy_handler(int irq, void *dev_id) {
     data->data_ready = true;
     wake_up_interruptible(&data->wait);
     return IRQ_HANDLED;
+}
+
+static void ads1256_sample_work(struct work_struct *work) {
+    struct ads1256_data *data = container_of(work, struct ads1256_data, sample_work);
+    struct ads1256_mux_sample sample;
+    int ret;
+
+    if (!data->buffering_enabled)
+        return;  // Exit if disabled
+
+    // Use the next MUX config from the stored list, cycling through
+    if (data->num_samples > 0) {
+        sample.mux_config = data->mux_samples[data->buffer_head % data->num_samples].mux_config;
+    } else {
+        sample.mux_config = ADS1256_MUX_RESET;  // Fallback if no MUX configs set
+    }
+
+    ret = ads1256_read_sample(data, &sample);
+    if (ret == 0) {
+        mutex_lock(&data->lock);
+        if (data->buffer_count < data->buffer_size) {
+            data->sample_buffer[data->buffer_head] = sample;
+            data->buffer_head = (data->buffer_head + 1) % data->buffer_size;
+            data->buffer_count++;
+            wake_up_interruptible(&data->wait);
+        } else {
+            atomic_inc(&data->dropped_samples);
+        }
+        mutex_unlock(&data->lock);
+        usleep_range(ads1256_get_timeout_us(data) - 10, ads1256_get_timeout_us(data));  // Match sample rate
+        schedule_work(&data->sample_work);
+    } else if (ret != -EINTR) {  // Retry on non-signal errors
+        usleep_range(1000, 2000);  // Small delay before retry
+        schedule_work(&data->sample_work);
+    }
 }
 
 static ssize_t current_sample_show(struct device *dev, struct device_attribute *attr, char *buf) {
@@ -748,6 +871,12 @@ static ssize_t last_sample_show(struct device *dev, struct device_attribute *att
     return snprintf(buf, PAGE_SIZE, "0x%08x at %llu ns\n", sample.value, sample.timestamp);
 }
 static DEVICE_ATTR_RO(last_sample);
+
+static ssize_t dropped_samples_show(struct device *dev, struct device_attribute *attr, char *buf) {
+    struct ads1256_data *data = dev_get_drvdata(dev);
+    return snprintf(buf, PAGE_SIZE, "%d\n", atomic_read(&data->dropped_samples));
+}
+static DEVICE_ATTR_RO(dropped_samples);
 
 static ssize_t calibrate_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
     struct ads1256_data *data = dev_get_drvdata(dev);
@@ -945,6 +1074,24 @@ static int ads1256_probe(struct spi_device *spi) {
         return -ENOMEM;
     }
 
+    // Buffer
+    if (buffer_size <= 0 || buffer_size > 65536) {  // Reasonable upper limit
+        dev_warn(&spi->dev, "Invalid buffer_size %d, using default 1024\n", buffer_size);
+        buffer_size = data->buffer_size;
+    }
+    data->sample_buffer = kmalloc_array(buffer_size, sizeof(struct ads1256_mux_sample), GFP_KERNEL);
+    if (!data->sample_buffer) {
+        dev_err(&spi->dev, "Failed to allocate sample buffer\n");
+        return -ENOMEM;
+    }
+    data->buffer_size = buffer_size;  // Add this to struct ads1256_data
+    data->buffer_head = 0;
+    data->buffer_tail = 0;
+    data->buffer_count = 0;
+    data->buffering_enabled = false;  // Default off, enable via ioctl/sysfs
+    INIT_WORK(&data->sample_work, ads1256_sample_work);
+    atomic_set(&data->dropped_samples, 0);
+
     data->spi = spi;
     data->bus_num = bus_num;
     data->cs_num = spi->chip_select;
@@ -1107,6 +1254,10 @@ static int ads1256_probe(struct spi_device *spi) {
     ret = device_create_file(data->device, &dev_attr_pga_gain);
     if (ret)
         dev_warn(&data->spi->dev, "Failed to create pga_gain sysfs: %d\n", ret);
+    
+    ret = device_create_file(data->device, &dev_attr_dropped_samples);
+    if (ret)
+        dev_warn(&spi->dev, "Failed to create dropped_samples sysfs: %d\n", ret);
 
     // Initialize and configure the ADS1256
     ret = ads1256_reset(data);
@@ -1185,6 +1336,12 @@ static int ads1256_remove(struct spi_device *spi) {
     int device_index;
 
     if (data) {
+        cancel_work_sync(&data->sample_work);  // Stop workqueue
+        mutex_lock(&data->lock);
+        kfree(data->sample_buffer);            // Free buffer
+        data->sample_buffer = NULL;
+        mutex_unlock(&data->lock);
+
         if (data->irq >= 0) {
             free_irq(data->irq, data);
             data->irq = -1;  // Prevent double-free attempts
@@ -1206,6 +1363,7 @@ static int ads1256_remove(struct spi_device *spi) {
             device_remove_file(data->device, &dev_attr_current_sample);  // Always attempt, safe if not present
             device_remove_file(data->device, &dev_attr_data_rate);
             device_remove_file(data->device, &dev_attr_pga_gain);
+            device_remove_file(data->device, &dev_attr_dropped_samples);
             device_destroy(ads1256_class, data->devt);  // Use per-device devt
             data->device = NULL;  // Prevent double-destroy
         }
