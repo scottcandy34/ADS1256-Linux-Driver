@@ -14,24 +14,105 @@
 #define ADS1256_NAME "ads1256"
 #define ADS1256_DRDY_TIMEOUT 33000  // microseconds (33 ms for 30 SPS)
 
-// ADS1256 Commands
-#define ADS1256_CMD_RESET   0xFE  // Reset
-#define ADS1256_CMD_START   0x08  // Start/Sync (start conversions)
-#define ADS1256_CMD_STOP    0x0A  // Stop conversions
-#define ADS1256_CMD_RDATA   0x01  // Read Data
-#define ADS1256_CMD_RREG    0x10  // Read Register
-#define ADS1256_CMD_WREG    0x50  // Write Register
+// ADS1256 Commands (see p34)
+#define ADS1256_CMD_WAKEUP	    0x00  // Completes SYNC and Exits Standby Mode 0000  0000 (00h)
+#define ADS1256_CMD_RDATA       0x01  // Read Data 0000  0001 (01h)
+#define ADS1256_CMD_RDATAC	    0x03  // Read Data Continuously 0000   0011 (03h)
+#define ADS1256_CMD_SDATAC	    0x0F  // Stop Read Data Continuously 0000   1111 (0Fh)
+#define ADS1256_REG_secdCMD     0x00  // This is the second command byte that is to be used along with WREG and RREG
+#define ADS1256_CMD_RREG        0x10  // Read from Register rrr 0001 rrrr (1xh)
+#define ADS1256_CMD_WREG        0x50  // Write to Register rrr 0101 rrrr (5xh)
+#define ADS1256_CMD_SELFCAL	    0xF0  // Offset and Gain Self-Calibration 1111    0000 (F0h)
+#define ADS1256_CMD_SELFOCAL	0xF1  // Offset Self-Calibration 1111    0001 (F1h)
+#define ADS1256_CMD_SELFGCAL	0xF2  // Gain Self-Calibration 1111    0010 (F2h)
+#define ADS1256_CMD_SYOCAL	    0xF3  // System Offset Calibration 1111   0011 (F3h)
+#define ADS1256_CMD_SYGCAL	    0xF4  // System Gain Calibration 1111    0100 (F4h)
+#define ADS1256_CMD_SYNC	    0xFC  // Synchronize the A/D Conversion 1111   1100 (FCh)
+#define ADS1256_CMD_STANDBY	    0xFD  // Begin Standby Mode 1111   1101 (FDh)
+#define ADS1256_CMD_RESET       0xFE  // Reset to Power-Up Values 1111   1110 (FEh)
+#define ADS1256_CMD_NOP	        0xFF
 
-// ADS1256 Register Addresses
-#define ADS1256_REG_STATUS  0x00  // Status Register
-#define ADS1256_REG_MUX     0x01  // MUX Register (channel selection)
-#define ADS1256_REG_ADCON   0x02  // A/D Control Register (PGA, clock)
-#define ADS1256_REG_DRATE   0x03  // Data Rate Register
+// ADS1256 Register Addresses (see p30)
+#define ADS1256_REG_STATUS      0x00  // Status Register
+#define ADS1256_REG_MUX         0x01  // MUX Register (channel selection)
+#define ADS1256_REG_ADCON       0x02  // A/D Control Register (PGA, clock)
+#define ADS1256_REG_DRATE       0x03  // Data Rate Register
+#define ADS1256_REG_IO		    0x04  
+#define ADS1256_REG_OFCAL0	    0x05  
+#define ADS1256_REG_OFCAL1	    0x06  
+#define ADS1256_REG_OFCAL2	    0x07  
+#define ADS1256_REG_FSCAL0	    0x08  
+#define ADS1256_REG_FSCAL1	    0x09  
+#define ADS1256_REG_FSCAL2	    0x0A  
+
+// Status Control Register (see p30)
+#define ADS1256_STATUS_ID           0x30  // Factory Programmed Identification Bits (Read Only)
+#define ADS1256_STATUS_RESET        0x01  // Reset STATUS Register
+#define ADS1256_STATUS_ORDER_LSB    0x08  // Least significant Bit first, MSB is default 
+#define ADS1256_STATUS_ACAL_ON      0x04  // Auto Calibration Enabled, Disabled by default
+#define ADS1256_STATUS_BUFFER_ON    0x02  // BUffer Enabled, Disabled by default
+
+// Multiplexer Control Register (see p31)
+//      ADS125x common channels
+#define ADS1256_MUX_AIN0		    0x00
+#define ADS1256_MUX_AIN1	    	0x01
+#define ADS1256_MUX_AINCOM	        0x0c
+//      ADS1256 only channels
+#define ADS1256_MUX_AIN2		    0x02
+#define ADS1256_MUX_AIN3		    0x03
+#define ADS1256_MUX_AIN4		    0x04
+#define ADS1256_MUX_AIN5		    0x05
+#define ADS1256_MUX_AIN6		    0x06
+#define ADS1256_MUX_AIN7		    0x07
+#define ADS1256_MAX_CHANNELS	8
+
+// A/D Control Register (see p31)
+//      D0/CLKOUT Clock Out Rate Setting
+#define ADS1256_ADCON_CLK_1		    0x20  // Clock Out Frequency = fCLKIN
+#define ADS1256_ADCON_CLK_2	    	0x40  // Clock Out Frequency = fCLKIN/2
+#define ADS1256_ADCON_CLK_4		    0x60  // Clock Out Frequency = fCLKIN/4
+//      Sensor Detection Current Sources
+#define ADS1256_ADCON_SDCS_0d5		0x08  // Sensor Detect Current 0.5uA
+#define ADS1256_ADCON_SDCS_2		0x10  // Sensor Detect Current 2uA
+#define ADS1256_ADCON_SDCS_10		0x18  // Sensor Detect Current 10uA
+//      Programmable Gain Amplifier Setting
+#define ADS1256_ADCON_PGA_1		    0x00  // Programmable Gain Amplifier Setting, of 1
+#define ADS1256_ADCON_PGA_2		    0x01  // Programmable Gain Amplifier Setting, of 2
+#define ADS1256_ADCON_PGA_4		    0x02  // Programmable Gain Amplifier Setting, of 4
+#define ADS1256_ADCON_PGA_8		    0x03  // Programmable Gain Amplifier Setting, of 8
+#define ADS1256_ADCON_PGA_16		0x04  // Programmable Gain Amplifier Setting, of 16
+#define ADS1256_ADCON_PGA_32		0x05  // Programmable Gain Amplifier Setting, of 32
+#define ADS1256_ADCON_PGA_64		0x06  // Programmable Gain Amplifier Setting, of 64
+
+// A/D Data Rate Register (see p32)
+#define ADS1256_DRATE_SPS_30000		0xF0  // 30,000 SPS, Samples per sec
+#define ADS1256_DRATE_SPS_15000		0xE0  // 15,000 SPS, Samples per sec
+#define ADS1256_DRATE_SPS_7500		0xD0  // 7,500 SPS, Samples per sec
+#define ADS1256_DRATE_SPS_3750		0xC0  // 3,750 SPS, Samples per sec
+#define ADS1256_DRATE_SPS_2000		0xB0  // 2,000 SPS, Samples per sec
+#define ADS1256_DRATE_SPS_1000		0xA1  // 1,000 SPS, Samples per sec
+#define ADS1256_DRATE_SPS_500		0x92  // 500 SPS, Samples per sec
+#define ADS1256_DRATE_SPS_100		0x82  // 100 SPS, Samples per sec
+#define ADS1256_DRATE_SPS_60		0x72  // 60 SPS, Samples per sec
+#define ADS1256_DRATE_SPS_50		0x63  // 50 SPS, Samples per sec
+#define ADS1256_DRATE_SPS_30		0x53  // 30 SPS, Samples per sec
+#define ADS1256_DRATE_SPS_25		0x43  // 25 SPS, Samples per sec
+#define ADS1256_DRATE_SPS_15		0x33  // 15 SPS, Samples per sec
+#define ADS1256_DRATE_SPS_10		0x20  // 10 SPS, Samples per sec
+#define ADS1256_DRATE_SPS_5 		0x13  // 5 SPS, Samples per sec
+#define ADS1256_DRATE_SPS_2d5		0x03  // 2.5 SPS, Samples per sec
+
+// GPIO Control Register (see p32)
+#define ADS1256_IO_RESET		0xE0  // Reset I/O Register to Default
+#define ADS1256_IO_DIR3_IN		0x80  // DIR3 - Digital I/O Direction for Pin D3
+#define ADS1256_IO_DIR2_IN		0x40  // DIR2 - Digital I/O Direction for Pin D2
+#define ADS1256_IO_DIR1_IN		0x20  // DIR1 - Digital I/O Direction for Pin D1
+#define ADS1256_IO_DIR0_IN		0x10  // DIR0 - Digital I/O Direction for Pin D0/CLKOUT
 
 // Default Configuration Values
-#define ADS1256_MUX_DEFAULT 0x01  // Select AIN0 (channel 0) as input
-#define ADS1256_ADCON_DEFAULT 0x20  // PGA = 1 (gain 1), clock = internal
-#define ADS1256_DRATE_DEFAULT 0x03  // Data rate = 30 SPS (samples per second)
+#define ADS1256_MUX_DEFAULT         0x01  // Select AIN0 (channel 0) as input
+#define ADS1256_ADCON_DEFAULT       0x20  // PGA = 1 (gain 1), clock = internal
+#define ADS1256_DRATE_DEFAULT       0x03  // Data rate = 30 SPS (samples per second)
 
 // Driver data structure
 struct ads1256_data {
@@ -55,91 +136,110 @@ static int ads1256_devt_match(struct device *dev, const void *data)
     return dev && dev->devt == target;
 }
 
-// Reset the ADS1256
-static int ads1256_reset(struct ads1256_data *data) {
-    int ret;
-    u8 cmd = ADS1256_CMD_RESET;
+/* SPI Transfer Helper */
+static int ads1256_spi_transfer(struct ads1256_data *data, u8 *tx_buf, u8 *rx_buf, int len)
+{
     struct spi_transfer t = {
-        .tx_buf = &cmd,
-        .len = 1,
+        .tx_buf = tx_buf,
+        .rx_buf = rx_buf,
+        .len = len,
     };
     struct spi_message m;
 
     spi_message_init(&m);
     spi_message_add_tail(&t, &m);
+    return spi_sync(data->spi, &m);
+}
+
+/* Write to ADS1256 Register */
+static int ads1256_write_reg(struct ads1256_data *data, u8 reg, u8 value)
+{
+    u8 tx_buf[3] = { ADS1256_CMD_WREG | reg, ADS1256_REG_secdCMD, value };
+    return ads1256_spi_transfer(data, tx_buf, NULL, 3);
+}
+
+/* Read from ADS1256 Register */
+static u8 ads1256_read_reg(struct ads1256_data *data, u8 reg)
+{
+    u8 tx_buf[2] = { ADS1256_CMD_RREG | reg, 0x00 };
+    u8 rx_buf[2] = { 0 };
+    ads1256_spi_transfer(data, tx_buf, rx_buf, 2);
+    return rx_buf[1];
+}
+
+// Reset the ADS1256
+static int ads1256_reset(struct ads1256_data *data) {
+    int ret;
+    u8 reset_cmd = ADS1256_CMD_RESET;
+    u8 sdatac_cmd = ADS1256_CMD_SDATAC;
 
     mutex_lock(&data->lock);
-    ret = spi_sync(data->spi, &m);
+    ret = ads1256_spi_transfer(data, &reset_cmd, NULL, 1);
     if (ret == 0) {
         // Wait after reset (per datasheet, 0.5 ms minimum) using usleep_range for robustness
         usleep_range(500, 1000);  // Sleep 500-1000 us (0.5-1 ms)
         dev_info(&data->spi->dev, "ADS1256 reset successful\n");
     } else {
         dev_err(&data->spi->dev, "ADS1256 reset failed: %d\n", ret);
+        goto out;
     }
-    mutex_unlock(&data->lock);
 
+    ret = ads1256_spi_transfer(data, &sdatac_cmd, NULL, 1);
+    if (ret == 0) {
+        // Wait after reset (per datasheet, 0.5 ms minimum) using usleep_range for robustness
+        usleep_range(500, 1000);  // Sleep 500-1000 us (0.5-1 ms)
+        dev_info(&data->spi->dev, "ADS1256 stop read data continuously successful\n");
+    } else {
+        dev_err(&data->spi->dev, "ADS1256 stop read data continuously failed: %d\n", ret);
+        goto out;
+    }
+out:
+    mutex_unlock(&data->lock);
     return ret;
 }
 
 // Configure the ADS1256
 static int ads1256_configure(struct ads1256_data *data) {
     int ret;
-    u8 tx_buf[3], rx_buf[3];
-    struct spi_transfer t[] = {
-        {
-            .tx_buf = tx_buf,
-            .rx_buf = rx_buf,
-            .len = 3,
-        },
-    };
-    struct spi_message m;
+
+    mutex_lock(&data->lock);
+    // Set STATUS Reg with buffer on.
+    ret = ads1256_write_reg(data, ADS1256_REG_STATUS, ADS1256_STATUS_ID | ADS1256_STATUS_BUFFER_ON);
+    if (ret) {
+        dev_err(&data->spi->dev, "Failed to set Buffer ON: %d\n", ret);
+        goto out;
+    }
 
     // Set MUX (AIN0 as input, AINCOM as reference)
-    tx_buf[0] = ADS1256_CMD_WREG | ADS1256_REG_MUX;
-    tx_buf[1] = 0x00;  // Number of registers to write - 1
-    tx_buf[2] = ADS1256_MUX_DEFAULT;  // AIN0, AINCOM
-    spi_message_init(&m);
-    spi_message_add_tail(&t[0], &m);
-    mutex_lock(&data->lock);
-    ret = spi_sync(data->spi, &m);
+    ret = ads1256_write_reg(data, ADS1256_REG_MUX, ADS1256_MUX_DEFAULT);
     if (ret) {
         dev_err(&data->spi->dev, "Failed to set MUX: %d\n", ret);
         goto out;
     }
 
     // Set ADCON (PGA = 1, internal clock)
-    tx_buf[0] = ADS1256_CMD_WREG | ADS1256_REG_ADCON;
-    tx_buf[1] = 0x00;
-    tx_buf[2] = ADS1256_ADCON_DEFAULT;
-    spi_message_init(&m);
-    spi_message_add_tail(&t[0], &m);
-    ret = spi_sync(data->spi, &m);
+    ret = ads1256_write_reg(data, ADS1256_REG_ADCON, ADS1256_ADCON_DEFAULT);
     if (ret) {
         dev_err(&data->spi->dev, "Failed to set ADCON: %d\n", ret);
         goto out;
     }
 
     // Set DRATE (30 SPS)
-    tx_buf[0] = ADS1256_CMD_WREG | ADS1256_REG_DRATE;
-    tx_buf[1] = 0x00;
-    tx_buf[2] = ADS1256_DRATE_DEFAULT;
-    spi_message_init(&m);
-    spi_message_add_tail(&t[0], &m);
-    ret = spi_sync(data->spi, &m);
+    ret = ads1256_write_reg(data, ADS1256_REG_DRATE, ADS1256_DRATE_DEFAULT);
     if (ret) {
         dev_err(&data->spi->dev, "Failed to set DRATE: %d\n", ret);
         goto out;
     }
 
     // Start conversions
-    tx_buf[0] = ADS1256_CMD_START;
-    t[0].len = 1;
-    spi_message_init(&m);
-    spi_message_add_tail(&t[0], &m);
-    ret = spi_sync(data->spi, &m);
-    if (ret) {
-        dev_err(&data->spi->dev, "Failed to start conversions: %d\n", ret);
+    u8 selfcal_cmd = ADS1256_CMD_SELFCAL;
+    ret = ads1256_spi_transfer(data, &selfcal_cmd, NULL, 1);
+    if (ret == 0) {
+        // Wait after reset (per datasheet, 0.5 ms minimum) using usleep_range for robustness
+        usleep_range(500, 1000);  // Sleep 500-1000 us (0.5-1 ms)
+        dev_info(&data->spi->dev, "Self calibration completed\n");
+    } else {
+        dev_err(&data->spi->dev, "Failed self calibration: %d\n", ret);
         goto out;
     }
 
@@ -152,17 +252,6 @@ out:
 // Read one sample from channel 0, with DRDY polling
 static int ads1256_read_sample(struct ads1256_data *data, u32 *value) {
     int ret;
-    struct spi_transfer t[] = {
-        {
-            .tx_buf = data->tx_buf,
-            .len = 1,
-        },
-        {
-            .rx_buf = data->rx_buf,
-            .len = 3,
-        }
-    };
-    struct spi_message m;
     int timeout = 1000;  // 1 second timeout (adjust as needed)
 
     // Poll DRDY (active-low, so wait for it to go low)
@@ -175,28 +264,27 @@ static int ads1256_read_sample(struct ads1256_data *data, u32 *value) {
     }
     dev_info(&data->spi->dev, "DRDY asserted, proceeding to read\n");
 
-    // Send RDATA command
-    data->tx_buf[0] = ADS1256_CMD_RDATA;
-    spi_message_init(&m);
-    spi_message_add_tail(&t[0], &m);
-    spi_message_add_tail(&t[1], &m);
-
     mutex_lock(&data->lock);
+
+    // Send RDATA command
     dev_info(&data->spi->dev, "Sending RDATA command, TX buffer: 0x%02x\n", data->tx_buf[0]);
-    ret = spi_sync(data->spi, &m);
+    u8 rdata_cmd = ADS1256_CMD_RDATA;
+    ret = ads1256_spi_transfer(data, &rdata_cmd, data->rx_buf, 4);
     if (ret == 0) {
         // Combine 3 bytes into 24-bit value (two's complement for signed value)
         *value = (data->rx_buf[0] << 16) | (data->rx_buf[1] << 8) | data->rx_buf[2];
-        if (*value & 0x800000) {  // Handle negative values (two's complement)
-            *value |= 0xFF000000;  // Sign-extend to 32 bits
-        }
+        // if (*value & 0x800000) {  // Handle negative values (two's complement)
+        //     *value |= 0xFF000000;  // Sign-extend to 32 bits
+        // }
         dev_info(&data->spi->dev, "Read sample: 0x%08x (raw: 0x%02x 0x%02x 0x%02x)\n",
                  *value, data->rx_buf[0], data->rx_buf[1], data->rx_buf[2]);
     } else {
         dev_err(&data->spi->dev, "SPI sync failed: %d\n", ret);
+        goto out;
     }
-    mutex_unlock(&data->lock);
 
+out:
+    mutex_unlock(&data->lock);
     return ret;
 }
 
@@ -301,7 +389,8 @@ static int ads1256_probe(struct spi_device *spi) {
     int ret;
     int attempt = 0;
     const int MAX_ATTEMPTS = 10;  // Increased attempts for robustness
-
+	
+	/* Allocate device data */
     data = devm_kzalloc(&spi->dev, sizeof(*data), GFP_KERNEL);
     if (!data) {
         dev_err(&spi->dev, "Failed to allocate memory for driver data: %d\n", -ENOMEM);
@@ -336,6 +425,7 @@ static int ads1256_probe(struct spi_device *spi) {
     }
     dev_info(&spi->dev, "SPI setup succeeded with mode 1\n");
 
+	/* Register Character Device */
     // Dynamically allocate a major number and handle conflicts
     do {
         ret = register_chrdev(0, ADS1256_NAME, &ads1256_fops);
@@ -435,6 +525,7 @@ err_free_data:
     return ret;
 }
 
+// SPI remove function
 static int ads1256_remove(struct spi_device *spi) {
     struct ads1256_data *data = spi_get_drvdata(spi);
 
@@ -445,6 +536,7 @@ static int ads1256_remove(struct spi_device *spi) {
         cdev_del(&ads1256_cdev);  // Clean up cdev
         unregister_chrdev(ads1256_major, ADS1256_NAME);
     }
+	// dev_info(&spi->dev, "ADS1256_%d removed\n", data->index);
     return 0;  // Return an int to match the spi_driver.remove signature
 }
 
