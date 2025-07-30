@@ -12,10 +12,13 @@
 #include <linux/interrupt.h>        // For DRDY interupt handling
 #include <linux/ioctl.h>
 #include <linux/ktime.h>            // For timestamps
+#include <linux/workqueue.h>
 
 // Define constants
 #define ADS1256_NAME "ads1256"
 #define ADS1256_DRDY_TIMEOUT 33000  // microseconds (33 ms for 30 SPS)
+#define MAX_ADS1256_DEVICES 5  // SPI0, SPI3, SPI4, SPI5, SPI6
+#define SYNC_TIMEOUT_MS 5000  // 5 seconds timeout
 
 // ADS1256 Commands (see p34)
 #define ADS1256_CMD_WAKEUP	    0x00  // Completes SYNC and Exits Standby Mode 0000  0000 (00h)
@@ -123,16 +126,25 @@
 #define ADS1256_SET_DATA_RATE _IOW(ADS1256_IOC_MAGIC, 1, int)
 #define ADS1256_SET_PGA_GAIN  _IOW(ADS1256_IOC_MAGIC, 2, int)
 
+static atomic_t ads1256_device_count = ATOMIC_INIT(0);
+static struct ads1256_data *ads1256_devices[MAX_ADS1256_DEVICES];
+static DEFINE_SPINLOCK(device_list_lock);
+
 static int data_rate = ADS1256_DRATE_SPS_30000;
-static int pga_gain = ADS1256_ADCON_PGA_1;
 module_param(data_rate, int, 0644);
-module_param(pga_gain, int, 0644);
 MODULE_PARM_DESC(data_rate, "ADS1256 data rate (default: 0xF0 = 30,000 SPS)");
+
+static int pga_gain = ADS1256_ADCON_PGA_1;
+module_param(pga_gain, int, 0644);
 MODULE_PARM_DESC(pga_gain, "ADS1256 PGA gain (default: 0x00 = 1)");
 
 static int debug = 0;
 module_param(debug, int, 0644);
 MODULE_PARM_DESC(debug, "Enable debug logging (0=off, 1=on)");
+
+static struct gpio_desc *shared_sync_gpio;  // Global sync GPIO descriptor
+static DEFINE_MUTEX(sync_mutex);            // Mutex for sync operations
+static struct delayed_work sync_work;
 
 struct ads1256_mux_sample {
     u8 mux_config;
@@ -185,6 +197,7 @@ struct ads1256_data {
     struct spi_device *spi;
     struct mutex lock;
     struct gpio_desc *drdy_gpio;
+    struct gpio_desc *sync_gpio;  // Shared sync GPIO
     u8 tx_buf[4];
     u8 rx_buf[4];
     wait_queue_head_t wait;
@@ -196,12 +209,14 @@ struct ads1256_data {
     size_t num_samples;
     bool sampling_active;
     struct ads1256_mux_sample last_sample;
+    struct cdev cdev;           // Per-device cdev
+    struct device *device;      // Per-device device pointer
+    int dev_num;                // SPI bus number (0, 3, 4, 5, 6)
+    dev_t devt;                 // Device number (major + minor)
 };
 
-static int ads1256_major;
-static struct class *ads1256_class;
-static struct device *ads1256_device;
-static struct cdev ads1256_cdev;  // Add cdev for manual management
+static struct class *ads1256_class;  // Single class for all devices
+static int ads1256_major;            // Single major number for all devices
 
 // Match function for class_find_device to find device by dev_t
 static int ads1256_devt_match(struct device *dev, const void *data) {
@@ -686,6 +701,59 @@ static const struct file_operations ads1256_fops = {
     .release = ads1256_release,
 };
 
+static int ads1256_sync_all(void) {
+    int ret = 0, i;
+    u8 sync_cmd = ADS1256_CMD_SYNC;
+
+    mutex_lock(&sync_mutex);
+    if (!shared_sync_gpio) {
+        pr_err("Sync GPIO not configured, cannot synchronize devices\n");
+        mutex_unlock(&sync_mutex);
+        return -EINVAL;
+    }
+
+    gpiod_set_value_cansleep(shared_sync_gpio, 0);
+    usleep_range(10, 20);
+    gpiod_set_value_cansleep(shared_sync_gpio, 1);
+    usleep_range(10, 20);
+
+    spin_lock(&device_list_lock);
+    for (i = 0; i < MAX_ADS1256_DEVICES; i++) {
+        struct ads1256_data *data = ads1256_devices[i];
+        if (data) {
+            mutex_lock(&data->lock);
+            ret = ads1256_spi_transfer(data, &sync_cmd, NULL, 1);
+            if (ret) {
+                dev_err(&data->spi->dev, "Failed to send SYNC command on SPI%d: %d\n", data->dev_num, ret);
+            } else {
+                dev_info(&data->spi->dev, "Synchronization triggered on SPI%d\n", data->dev_num);
+            }
+            mutex_unlock(&data->lock);
+            if (ret) break;
+        }
+    }
+    spin_unlock(&device_list_lock);
+
+    mutex_unlock(&sync_mutex);
+    return ret;
+}
+
+static void ads1256_sync_work_handler(struct work_struct *work) {
+    int ret = ads1256_sync_all();
+    if (ret) {
+        pr_err("Timeout sync failed: %d\n", ret);
+    } else {
+        pr_info("Timeout sync completed for %d devices\n", atomic_read(&ads1256_device_count));
+    }
+}
+
+static irqreturn_t ads1256_drdy_handler(int irq, void *dev_id) {
+    struct ads1256_data *data = dev_id;
+    data->data_ready = true;
+    wake_up_interruptible(&data->wait);
+    return IRQ_HANDLED;
+}
+
 static ssize_t current_sample_show(struct device *dev, struct device_attribute *attr, char *buf) {
     struct ads1256_data *data = dev_get_drvdata(dev);
     int ret;
@@ -710,13 +778,6 @@ static ssize_t last_sample_show(struct device *dev, struct device_attribute *att
 }
 static DEVICE_ATTR_RO(last_sample);
 
-static irqreturn_t ads1256_drdy_handler(int irq, void *dev_id) {
-    struct ads1256_data *data = dev_id;
-    data->data_ready = true;
-    wake_up_interruptible(&data->wait);
-    return IRQ_HANDLED;
-}
-
 static ssize_t calibrate_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
     struct ads1256_data *data = dev_get_drvdata(dev);
     u8 selfcal_cmd = ADS1256_CMD_SELFCAL;
@@ -735,11 +796,27 @@ static ssize_t calibrate_store(struct device *dev, struct device_attribute *attr
 }
 static DEVICE_ATTR_WO(calibrate);
 
+static ssize_t sync_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
+    int ret = ads1256_sync_all();
+    if (ret) {
+        return ret;
+    }
+    return count;
+}
+static DEVICE_ATTR_WO(sync);
+
 static int ads1256_probe(struct spi_device *spi) {
     struct ads1256_data *data;
     int ret;
-    int attempt = 0;
-    const int MAX_ATTEMPTS = 10;  // Increased attempts for robustness
+    int bus_num = spi->master->bus_num;
+    char dev_name[16];
+    int device_index;
+
+    // Only support SPI0, SPI3, SPI4, SPI5, SPI6
+    if (bus_num != 0 && bus_num != 3 && bus_num != 4 && bus_num != 5 && bus_num != 6) {
+        dev_err(&spi->dev, "Unsupported SPI bus %d (only 0, 3, 4, 5, 6 allowed)\n", bus_num);
+        return -EINVAL;
+    }
 	
 	/* Allocate device data */
     data = devm_kzalloc(&spi->dev, sizeof(*data), GFP_KERNEL);
@@ -749,13 +826,16 @@ static int ads1256_probe(struct spi_device *spi) {
     }
 
     data->spi = spi;
+    data->dev_num = bus_num;
     mutex_init(&data->lock);
     data->mux_samples = NULL;
+    data->num_samples = 0;
     data->last_sample.mux_config = ADS1256_MUX_RESET;  // Default MUX
     data->last_sample.value = 0;                       // Default value
     data->last_sample.timestamp = 0;                   // Default timestamp
     spi_set_drvdata(spi, data);
 
+    // DRDY GPIO setup
     // Get DRDY GPIO from device tree (e.g., named "drdy")
     data->drdy_gpio = devm_gpiod_get(&spi->dev, "drdy", GPIOD_IN);
     if (IS_ERR(data->drdy_gpio)) {
@@ -778,10 +858,26 @@ static int ads1256_probe(struct spi_device *spi) {
         }
     }
 
+    // Sync GPIO setup (only request once)
+    mutex_lock(&sync_mutex);
+    if (!shared_sync_gpio) {
+        shared_sync_gpio = devm_gpiod_get(&spi->dev, "sync", GPIOD_OUT_HIGH);
+        if (IS_ERR(shared_sync_gpio)) {
+            ret = PTR_ERR(shared_sync_gpio);
+            dev_warn(&spi->dev, "Sync GPIO not found, synchronization disabled: %d\n", ret);
+            shared_sync_gpio = NULL;
+        } else {
+            dev_info(&spi->dev, "Shared sync GPIO retrieved: %p\n", shared_sync_gpio);
+            INIT_DELAYED_WORK(&sync_work, ads1256_sync_work_handler);  // Initialize workqueue
+        }
+    }
+    data->sync_gpio = shared_sync_gpio;  // Assign shared GPIO to this instance
+    mutex_unlock(&sync_mutex);
+
+    // SPI setup
     // Force SPI mode 1 (CPOL=0, CPHA=1) as per ADS1256 datasheet
     spi->mode = SPI_MODE_1;
     spi->bits_per_word = 8;
-    
     if (spi->max_speed_hz == 0 || spi->max_speed_hz > 10000000) {  // ADS1256 max is 10 MHz
         dev_warn(&spi->dev, "Invalid spi-max-frequency %u Hz, using default 2500000 Hz\n", spi->max_speed_hz);
         spi->max_speed_hz = 2500000;  // Fallback if not set or out of range
@@ -798,140 +894,189 @@ static int ads1256_probe(struct spi_device *spi) {
     dev_info(&spi->dev, "SPI setup succeeded with mode 1\n");
 
 	/* Register Character Device */
-    // Dynamically allocate a major number and handle conflicts
-    do {
+    // Register character device (one per SPI device)
+    if (!ads1256_major) {
         ret = register_chrdev(0, ADS1256_NAME, &ads1256_fops);
         if (ret < 0) {
-            dev_err(&spi->dev, "Failed to register chrdev on attempt %d: %d\n", attempt + 1, ret);
-            if (ret == -EBUSY && attempt < MAX_ATTEMPTS) {
-                msleep(200);  // Increased delay for robustness
-                attempt++;
-                continue;
-            }
+            dev_err(&spi->dev, "Failed to register chrdev: %d\n", ret);
             return ret;
         }
         ads1256_major = ret;
         dev_info(&spi->dev, "Registered chrdev with major number %d\n", ads1256_major);
-        break;
-    } while (attempt < MAX_ATTEMPTS);
 
-    // Manually manage cdev for better control
-    cdev_init(&ads1256_cdev, &ads1256_fops);
-    ads1256_cdev.owner = THIS_MODULE;
-    ret = cdev_add(&ads1256_cdev, MKDEV(ads1256_major, 0), 1);
-    if (ret < 0) {
-        dev_err(&spi->dev, "Failed to add cdev: %d\n", ret);
-        if (ret == -EBUSY) {
-            dev_err(&spi->dev, "cdev_add failed with EBUSY, checking for conflicts...\n");
-            // Try unregistering and retrying
+        ads1256_class = class_create(THIS_MODULE, ADS1256_NAME);
+        if (IS_ERR(ads1256_class)) {
+            ret = PTR_ERR(ads1256_class);
             unregister_chrdev(ads1256_major, ADS1256_NAME);
-            msleep(200);
-            ret = register_chrdev(0, ADS1256_NAME, &ads1256_fops);
-            if (ret < 0) {
-                dev_err(&spi->dev, "Failed to re-register chrdev: %d\n", ret);
-                goto err_unreg_chrdev;
-            }
-            ads1256_major = ret;
-            dev_info(&spi->dev, "Re-registered chrdev with major number %d\n", ads1256_major);
-            ret = cdev_add(&ads1256_cdev, MKDEV(ads1256_major, 0), 1);
-            if (ret < 0) {
-                dev_err(&spi->dev, "Failed to re-add cdev: %d\n", ret);
-                goto err_unreg_chrdev;
-            }
-        } else {
-            goto err_unreg_chrdev;
+            dev_err(&spi->dev, "Failed to create class: %d\n", ret);
+            return ret;
         }
+        dev_info(&spi->dev, "Class created: %p\n", ads1256_class);
+    }
+
+    data->devt = MKDEV(ads1256_major, bus_num);
+    cdev_init(&data->cdev, &ads1256_fops);
+    data->cdev.owner = THIS_MODULE;
+    ret = cdev_add(&data->cdev, data->devt, 1);
+    if (ret) {
+        dev_err(&spi->dev, "Failed to add cdev for SPI%d: %d\n", bus_num, ret);
+        goto err_cdev;
     }
     dev_info(&spi->dev, "cdev added: major=%d, minor=0, ret=%d\n", ads1256_major, ret);
 
-    ads1256_class = class_create(THIS_MODULE, ADS1256_NAME);
-    if (IS_ERR(ads1256_class)) {
-        ret = PTR_ERR(ads1256_class);
-        dev_err(&spi->dev, "Failed to create class: %d\n", ret);
-        goto err_del_cdev;
+    // Create device node (e.g., /dev/ads1256_0, /dev/ads1256_3)
+    snprintf(dev_name, sizeof(dev_name), "ads1256_%d", bus_num);
+    data->device = device_create(ads1256_class, &spi->dev, data->devt, data, dev_name);
+    if (IS_ERR(data->device)) {
+        ret = PTR_ERR(data->device);
+        dev_err(&spi->dev, "Failed to create device %s: %d\n", dev_name, ret);
+        goto err_device;
     }
-    dev_info(&spi->dev, "Class created: %p\n", ads1256_class);
 
-    ads1256_device = device_create(ads1256_class, NULL, MKDEV(ads1256_major, 0), data, ADS1256_NAME);
-    if (IS_ERR(ads1256_device)) {
-        ret = PTR_ERR(ads1256_device);
-        dev_err(&spi->dev, "Failed to create device: %d\n", ret);
-        goto err_destroy_class;
-    }
-    dev_info(&spi->dev, "Device created: %p, major=%d, minor=0\n", ads1256_device, ads1256_major);
+    // Log device creation
+    dev_info(&spi->dev, "Device created: %s, major=%d, minor=%d\n", dev_name, MAJOR(data->devt), MINOR(data->devt));
 
-    ret = device_create_file(ads1256_device, &dev_attr_current_sample);
+    // Sysfs attributes
+    ret = device_create_file(data->device, &dev_attr_current_sample);
+    if (ret)
+        dev_warn(&spi->dev, "Failed to create current_sample sysfs: %d\n", ret);
+
+    ret = device_create_file(data->device, &dev_attr_last_sample);
     if (ret) {
-        dev_warn(&spi->dev, "Failed to create current_sample sysfs file: %d\n", ret);
-    }
-
-    ret = device_create_file(ads1256_device, &dev_attr_last_sample);
-    if (ret) {
-        dev_warn(&spi->dev, "Failed to create last_sample sysfs file: %d\n", ret);
+        dev_warn(&spi->dev, "Failed to create last_sample sysfs: %d\n", ret);
     } else {
         data->sysfs_last_sample = true;
     }
 
-    ret = device_create_file(ads1256_device, &dev_attr_calibrate);
+    ret = device_create_file(data->device, &dev_attr_calibrate);
     if (ret) {
-        dev_warn(&spi->dev, "Failed to create calibrate sysfs file: %d\n", ret);
+        dev_warn(&spi->dev, "Failed to create calibrate sysfs: %d\n", ret);
     } else {
         data->sysfs_calibrate = true;
     }
 
-    // Store the driver data in the device for later retrieval
-    dev_set_drvdata(ads1256_device, data);
+    ret = device_create_file(data->device, &dev_attr_sync);
+    if (ret) {
+        dev_warn(&spi->dev, "Failed to create sync sysfs: %d\n", ret);
+    }
 
     // Initialize and configure the ADS1256
     ret = ads1256_reset(data);
     if (ret) {
         dev_err(&spi->dev, "Failed to reset ADS1256: %d\n", ret);
-        goto err_destroy_device;
+        goto err_init;
     }
     ret = ads1256_configure(data);
     if (ret) {
         dev_err(&spi->dev, "Failed to configure ADS1256: %d\n", ret);
-        goto err_destroy_device;
+        goto err_init;
     }
 
-    dev_info(&spi->dev, "ADS1256 driver initialized relying on SPI controller CS\n");
-    dev_info(&spi->dev, "Triggering udev for device node creation\n");
-    kobject_uevent(&ads1256_device->kobj, KOBJ_ADD);
+    // Register this device in the global list
+    spin_lock(&device_list_lock);
+    switch (bus_num) {
+    case 0: device_index = 0; break;
+    case 3: device_index = 1; break;
+    case 4: device_index = 2; break;
+    case 5: device_index = 3; break;
+    case 6: device_index = 4; break;
+    default: device_index = -1; break;  // Should never happen due to earlier check
+    }
+    if (device_index >= 0 && device_index < MAX_ADS1256_DEVICES) {
+        ads1256_devices[device_index] = data;
+    }
+    spin_unlock(&device_list_lock);
+
+    // Sync all devices now that a new one is added
+    ret = ads1256_sync_all();
+    if (ret) {
+        dev_err(&spi->dev, "Failed to sync devices after adding SPI%d: %d\n", bus_num, ret);
+    } else {
+        dev_info(&spi->dev, "Synced %d devices after adding SPI%d\n", atomic_read(&ads1256_device_count), bus_num);
+    }
+
+    // Schedule timeout to re-sync if no new devices are added
+    if (shared_sync_gpio) {
+        mod_delayed_work(system_wq, &sync_work, msecs_to_jiffies(SYNC_TIMEOUT_MS));
+    }
+
+    dev_info(&spi->dev, "ADS1256 on SPI%d initialized, device %s created\n", bus_num, dev_name);
+    kobject_uevent(&data->device->kobj, KOBJ_ADD);
     return 0;
 
-err_destroy_device:
-    device_destroy(ads1256_class, MKDEV(ads1256_major, 0));
-err_destroy_class:
-    class_destroy(ads1256_class);
-err_del_cdev:
-    cdev_del(&ads1256_cdev);
-err_unreg_chrdev:
-    unregister_chrdev(ads1256_major, ADS1256_NAME);
+err_init:
+    device_remove_file(data->device, &dev_attr_sync);
+    if (data->sysfs_calibrate)
+        device_remove_file(data->device, &dev_attr_calibrate);
+    if (data->sysfs_last_sample)
+        device_remove_file(data->device, &dev_attr_last_sample);
+    device_remove_file(data->device, &dev_attr_current_sample);
+    device_destroy(ads1256_class, data->devt);
+err_device:
+    cdev_del(&data->cdev);
+err_cdev:
+    if (bus_num == 0) {  // Only cleanup class/major on first failure
+        class_destroy(ads1256_class);
+        unregister_chrdev(ads1256_major, ADS1256_NAME);
+        ads1256_class = NULL;
+        ads1256_major = 0;
+    }
     return ret;
 }
 
 // SPI remove function
 static int ads1256_remove(struct spi_device *spi) {
     struct ads1256_data *data = spi_get_drvdata(spi);
+    int device_index;
+
     if (data) {
-        if (data->irq >= 0)
+        if (data->irq >= 0) {
             free_irq(data->irq, data);
-        mutex_lock(&data->lock);  // Protect against concurrent access
+            data->irq = -1;  // Prevent double-free attempts
+        }
+
+        mutex_lock(&data->lock);
         kfree(data->mux_samples);
         data->mux_samples = NULL;
+        data->num_samples = 0;
         mutex_unlock(&data->lock);
-        if (data->sysfs_last_sample)
-            device_remove_file(ads1256_device, &dev_attr_last_sample);
-        if (data->sysfs_calibrate)
-            device_remove_file(ads1256_device, &dev_attr_calibrate);
-        device_remove_file(ads1256_device, &dev_attr_current_sample);  // No need for flag
-        device_destroy(ads1256_class, MKDEV(ads1256_major, 0));
-        class_destroy(ads1256_class);
-        cdev_del(&ads1256_cdev);
-        unregister_chrdev(ads1256_major, ADS1256_NAME);
+
+        // Only remove sysfs files and device if they were created
+        if (data->device) {
+            device_remove_file(data->device, &dev_attr_sync);
+            if (data->sysfs_last_sample)
+                device_remove_file(data->device, &dev_attr_last_sample);
+            if (data->sysfs_calibrate)
+                device_remove_file(data->device, &dev_attr_calibrate);
+            device_remove_file(data->device, &dev_attr_current_sample);  // Always attempt, safe if not present
+            device_destroy(ads1256_class, data->devt);  // Use per-device devt
+            data->device = NULL;  // Prevent double-destroy
+        }
+
+        cdev_del(&data->cdev);
+
+        // Remove from device list
+        spin_lock(&device_list_lock);
+        switch (data->dev_num) {
+        case 0: device_index = 0; break;
+        case 3: device_index = 1; break;
+        case 4: device_index = 2; break;
+        case 5: device_index = 3; break;
+        case 6: device_index = 4; break;
+        default: device_index = -1; break;
+        }
+        if (device_index >= 0 && device_index < MAX_ADS1256_DEVICES) {
+            ads1256_devices[device_index] = NULL;
+        }
+        atomic_dec(&ads1256_device_count);
+        if (atomic_read(&ads1256_device_count) == 0 && shared_sync_gpio) {
+            cancel_delayed_work_sync(&sync_work);  // Cancel timeout if no devices remain
+        }
+        spin_unlock(&device_list_lock);
+
+        dev_info(&spi->dev, "ADS1256 on SPI%d removed\n", data->dev_num);
     }
     spi_set_drvdata(spi, NULL);
-    dev_info(&spi->dev, "ADS1256 removed\n");
     return 0;
 }
 
@@ -972,6 +1117,10 @@ static int __init ads1256_init(void) {
 
 static void __exit ads1256_exit(void) {
     spi_unregister_driver(&ads1256_driver);
+    if (ads1256_class) {
+        class_destroy(ads1256_class);
+        unregister_chrdev(ads1256_major, ADS1256_NAME);
+    }
 }
 
 module_init(ads1256_init);

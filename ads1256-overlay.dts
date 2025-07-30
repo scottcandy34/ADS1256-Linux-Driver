@@ -1,0 +1,179 @@
+/dts-v1/;
+/plugin/;
+
+
+/ {
+	compatible = "brcm,bcm2711";
+
+    __overrides__ {
+        spi0 = <&spi0>, "status:0=", "okay", "disabled";
+        spi3 = <&spi3>, "status:0=", "okay", "disabled";
+        spi4 = <&spi4>, "status:0=", "okay", "disabled";
+        spi5 = <&spi5>, "status:0=", "okay", "disabled";
+        spi6 = <&spi6>, "status:0=", "okay", "disabled";
+        drdy0_pin = <&ads1256_0>, "drdy-gpios:0";
+        drdy3_pin = <&ads1256_3>, "drdy-gpios:0";
+        drdy4_pin = <&ads1256_4>, "drdy-gpios:0";
+        drdy5_pin = <&ads1256_5>, "drdy-gpios:0";
+        drdy6_pin = <&ads1256_6>, "drdy-gpios:0";
+        sync_pin = <&ads1256_0>, "sync-gpios:0",
+                   <&ads1256_3>, "sync-gpios:0",
+                   <&ads1256_4>, "sync-gpios:0",
+                   <&ads1256_5>, "sync-gpios:0",
+                   <&ads1256_6>, "sync-gpios:0";
+        reset0_pin = <&ads1256_0>, "reset-gpios:0";
+        reset3_pin = <&ads1256_3>, "reset-gpios:0";
+        reset4_pin = <&ads1256_4>, "reset-gpios:0";
+        reset5_pin = <&ads1256_5>, "reset-gpios:0";
+        reset6_pin = <&ads1256_6>, "reset-gpios:0";
+    };
+
+    // SPI0
+	fragment@0 {
+		target = <&spi0_cs_pins>;
+		__overlay__ {
+			brcm,pins = <8>;
+		};
+	};
+	fragment@1 {
+		target = <&spi0>;
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			cs-gpios = <&gpio 8 0>;
+			status = "okay";
+
+            ads1256_0: ads1256@0 {
+                compatible = "ti,ads1256";
+                reg = <0>;
+                spi-max-frequency = <2500000>;
+                drdy-gpios = <&gpio 17 0>;
+                sync-gpios = <&gpio 16 0>;  // Shared sync pin
+                // reset-gpios omitted by default
+                status = "okay";
+            };
+		};
+	};
+
+    // SPI3
+    fragment@2 {
+		target = <&spi3_cs_pins>;
+		__overlay__ {
+			brcm,pins = <0>;
+		};
+	};
+    fragment@3 {
+        target = <&spi3>;
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <0>;
+            cs-gpios = <&gpio 0 0>;
+            status = "disabled";
+
+            ads1256_3: ads1256@0 {
+                compatible = "ti,ads1256";
+                reg = <0>;
+                spi-max-frequency = <2500000>;
+                drdy-gpios = <&gpio 24 0>;
+                sync-gpios = <&gpio 16 0>;  // Shared sync pin
+                // reset-gpios omitted by default
+                status = "okay";
+            };
+        };
+    };
+
+    // SPI4
+    fragment@4 {
+		target = <&spi4_cs_pins>;
+		__overlay__ {
+			brcm,pins = <4>;
+		};
+	};
+    fragment@5 {
+        target = <&spi4>;
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <0>;
+            cs-gpios = <&gpio 4 0>;
+            status = "disabled";
+
+            ads1256_4: ads1256@0 {
+                compatible = "ti,ads1256";
+                reg = <0>;
+                spi-max-frequency = <2500000>;
+                drdy-gpios = <&gpio 25 0>;
+                sync-gpios = <&gpio 16 0>;  // Shared sync pin
+                // reset-gpios omitted by default
+                status = "okay";
+            };
+        };
+    };
+
+    // SPI5
+    fragment@6 {
+		target = <&spi5_cs_pins>;
+		__overlay__ {
+			brcm,pins = <12>;
+		};
+	};
+    fragment@7 {
+        target = <&spi5>;
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <0>;
+            cs-gpios = <&gpio 12 0>;
+            status = "disabled";
+
+            ads1256_5: ads1256@0 {
+                compatible = "ti,ads1256";
+                reg = <0>;
+                spi-max-frequency = <2500000>;
+                drdy-gpios = <&gpio 26 0>;
+                sync-gpios = <&gpio 16 0>;  // Shared sync pin
+                // reset-gpios omitted by default
+                status = "okay";
+            };
+        };
+    };
+
+    // SPI6
+    fragment@8 {
+		target = <&spi6_cs_pins>;
+		__overlay__ {
+			brcm,pins = <18>;
+		};
+	};
+    fragment@9 {
+        target = <&spi6>;
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <0>;
+            cs-gpios = <&gpio 18 0>;
+            status = "disabled";
+
+            ads1256_6: ads1256@0 {
+                compatible = "ti,ads1256";
+                reg = <0>;
+                spi-max-frequency = <2500000>;
+                drdy-gpios = <&gpio 27 0>;
+                sync-gpios = <&gpio 16 0>;  // Shared sync pin
+                // reset-gpios omitted by default
+                status = "okay";
+            };
+        };
+    };
+
+    fragment@10 {
+        target = <&spidev0>;
+        __overlay__ {
+            status = "disabled";
+        };
+    };
+
+    fragment@11 {
+        target = <&spidev1>;
+        __overlay__ {
+            status = "disabled";
+        };
+    };
+};
