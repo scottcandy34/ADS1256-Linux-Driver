@@ -13,6 +13,7 @@
 #include <linux/ioctl.h>
 #include <linux/ktime.h>            // For timestamps
 #include <linux/workqueue.h>
+#include <linux/poll.h>
 
 // Define constants
 #define ADS1256_NAME "ads1256"
@@ -125,18 +126,11 @@
 #define ADS1256_IOC_MAGIC 'a'
 #define ADS1256_SET_DATA_RATE _IOW(ADS1256_IOC_MAGIC, 1, int)
 #define ADS1256_SET_PGA_GAIN  _IOW(ADS1256_IOC_MAGIC, 2, int)
+#define ADS1256_SET_SENSOR_DETECT _IOW(ADS1256_IOC_MAGIC, 4, int)
 
 static atomic_t ads1256_device_count = ATOMIC_INIT(0);
 static struct ads1256_data *ads1256_devices[MAX_ADS1256_DEVICES];
 static DEFINE_SPINLOCK(device_list_lock);
-
-static int data_rate = ADS1256_DRATE_SPS_30000;
-module_param(data_rate, int, 0644);
-MODULE_PARM_DESC(data_rate, "ADS1256 data rate (default: 0xF0 = 30,000 SPS)");
-
-static int pga_gain = ADS1256_ADCON_PGA_1;
-module_param(pga_gain, int, 0644);
-MODULE_PARM_DESC(pga_gain, "ADS1256 PGA gain (default: 0x00 = 1)");
 
 static int debug = 0;
 module_param(debug, int, 0644);
@@ -198,6 +192,7 @@ struct ads1256_data {
     struct mutex lock;
     struct gpio_desc *drdy_gpio;
     struct gpio_desc *sync_gpio;  // Shared sync GPIO
+    struct gpio_desc *reset_gpio;  // New field for reset pin
     u8 tx_buf[4];
     u8 rx_buf[4];
     wait_queue_head_t wait;
@@ -213,6 +208,8 @@ struct ads1256_data {
     struct device *device;      // Per-device device pointer
     int dev_num;                // SPI bus number (0, 3, 4, 5, 6)
     dev_t devt;                 // Device number (major + minor)
+    int data_rate;  // Per-device data rate
+    int pga_gain;   // Per-device PGA gain
 };
 
 static struct class *ads1256_class;  // Single class for all devices
@@ -265,13 +262,26 @@ static int ads1256_reset(struct ads1256_data *data) {
     u8 sdatac_cmd = ADS1256_CMD_SDATAC;
 
     mutex_lock(&data->lock);
-    ret = ads1256_spi_transfer(data, &reset_cmd, NULL, 1);
-    if (ret) {
-        dev_err(&data->spi->dev, "ADS1256 reset failed: %d\n", ret);
-        goto out;
-    }
-    usleep_range(500, 1000);
 
+    if (data->reset_gpio) {
+        // Hardware reset: assert low, then high (active-low assumed)
+        gpiod_set_value_cansleep(data->reset_gpio, 0);
+        usleep_range(10, 20);  // Minimum pulse width per datasheet
+        gpiod_set_value_cansleep(data->reset_gpio, 1);
+        usleep_range(500, 1000);  // Wait for device to stabilize
+        dev_info(&data->spi->dev, "ADS1256 hardware reset via GPIO\n");
+    } else {
+        // Software reset
+        ret = ads1256_spi_transfer(data, &reset_cmd, NULL, 1);
+        if (ret) {
+            dev_err(&data->spi->dev, "ADS1256 software reset failed: %d\n", ret);
+            goto out;
+        }
+        usleep_range(500, 1000);
+        dev_info(&data->spi->dev, "ADS1256 software reset successful\n");
+    }
+
+    // Always send SDATAC after reset to stop continuous mode
     ret = ads1256_spi_transfer(data, &sdatac_cmd, NULL, 1);
     if (ret) {
         dev_err(&data->spi->dev, "ADS1256 stop read data continuously failed: %d\n", ret);
@@ -279,7 +289,6 @@ static int ads1256_reset(struct ads1256_data *data) {
     }
     usleep_range(500, 1000);
 
-    dev_info(&data->spi->dev, "ADS1256 reset successful\n");
 out:
     mutex_unlock(&data->lock);
     return ret;
@@ -306,14 +315,14 @@ static int ads1256_configure(struct ads1256_data *data) {
     }
 
     // Set ADCON
-    ret = ads1256_write_reg(data, ADS1256_REG_ADCON, pga_gain);
+    ret = ads1256_write_reg(data, ADS1256_REG_ADCON, data->pga_gain);
     if (ret) {
         dev_err(&data->spi->dev, "Failed to set ADCON: %d\n", ret);
         goto out;
     }
 
     // Set DRATE
-    ret = ads1256_write_reg(data, ADS1256_REG_DRATE, data_rate);
+    ret = ads1256_write_reg(data, ADS1256_REG_DRATE, data->data_rate);
     if (ret) {
         dev_err(&data->spi->dev, "Failed to set DRATE: %d\n", ret);
         goto out;
@@ -327,14 +336,14 @@ static int ads1256_configure(struct ads1256_data *data) {
     }
 
     usleep_range(500, 1000);
-    dev_info(&data->spi->dev, "ADS1256 configured: DRATE=0x%02x, PGA=0x%02x\n", data_rate, pga_gain);
+    dev_info(&data->spi->dev, "ADS1256 configured: DRATE=0x%02x, PGA=0x%02x\n", data->data_rate, data->pga_gain);
 out:
     mutex_unlock(&data->lock);
     return ret;
 }
 
-static int ads1256_get_timeout_us(int drate) {
-    switch (drate) {
+static int ads1256_get_timeout_us(struct ads1256_data *data) {
+    switch (data->data_rate) {
     case ADS1256_DRATE_SPS_30000: return 33;    // 33 us
     case ADS1256_DRATE_SPS_15000: return 67;    // 67 us
     case ADS1256_DRATE_SPS_7500:  return 133;   // 133 us
@@ -358,7 +367,7 @@ static int ads1256_get_timeout_us(int drate) {
 // Read one sample from channel 0, with DRDY polling
 static int ads1256_read_sample(struct ads1256_data *data, struct ads1256_mux_sample *sample) {
     int ret;
-    int timeout = ads1256_get_timeout_us(data_rate) / 1000 + 1;  // Convert to ms iterations, add 1 for margin
+    int timeout = ads1256_get_timeout_us(data) / 1000 + 1;  // Convert to ms iterations, add 1 for margin
     u8 rdata_cmd = ADS1256_CMD_RDATA;
 
     mutex_lock(&data->lock);
@@ -369,6 +378,7 @@ static int ads1256_read_sample(struct ads1256_data *data, struct ads1256_mux_sam
         sample->timestamp = ktime_get_ns();  // Timestamp the failure
         goto out;
     }
+    mutex_unlock(&data->lock);  // Release lock before polling
     
     // Poll DRDY (active-low, so wait for it to go low)
     if (data->irq >= 0) {
@@ -376,7 +386,7 @@ static int ads1256_read_sample(struct ads1256_data *data, struct ads1256_mux_sam
         if (debug)
             dev_dbg(&data->spi->dev, "Waiting for DRDY interrupt\n");
         ret = wait_event_interruptible_timeout(data->wait, data->data_ready,
-                                               usecs_to_jiffies(ads1256_get_timeout_us(data_rate)));
+                                               usecs_to_jiffies(ads1256_get_timeout_us(data)));
         if (ret <= 0) {
             dev_err(&data->spi->dev, "DRDY interrupt timeout or signal\n");
             sample->timestamp = ktime_get_ns();  // Timestamp the timeout
@@ -384,7 +394,7 @@ static int ads1256_read_sample(struct ads1256_data *data, struct ads1256_mux_sam
             goto out;
         }
     } else if (data->drdy_gpio) {
-        int poll_delay_us = ads1256_get_timeout_us(data_rate) / 10;  // e.g., 1/10th of the sample period
+        int poll_delay_us = ads1256_get_timeout_us(data) / 10;  // e.g., 1/10th of the sample period
         if (poll_delay_us < 1) poll_delay_us = 1;  // Minimum 1 µs
         if (debug)
             dev_dbg(&data->spi->dev, "Polling DRDY GPIO\n");
@@ -398,12 +408,14 @@ static int ads1256_read_sample(struct ads1256_data *data, struct ads1256_mux_sam
             goto out;
         }
     } else {
-        if (debug)
-            dev_dbg(&data->spi->dev, "No DRDY GPIO, using fixed delay\n");
-        usleep_range(ads1256_get_timeout_us(data_rate), ads1256_get_timeout_us(data_rate) + 1000);
+        dev_err(&data->spi->dev, "No DRDY GPIO or IRQ available, cannot guarantee data readiness\n");
+        sample->timestamp = ktime_get_ns();
+        return -EINVAL;
     }
     if (debug)
         dev_dbg(&data->spi->dev, "DRDY asserted, proceeding to read\n");
+    
+    mutex_lock(&data->lock);  // Re-acquire lock for SPI transfer
 
     // Send RDATA command
     if (debug)
@@ -510,21 +522,22 @@ static ssize_t ads1256_read(struct file *filp, char __user *buf, size_t count, l
         count = num_samples * sizeof(struct ads1256_mux_sample);
     }
     data->sampling_active = true;  // Set flag
-    mutex_unlock(&data->lock);
 
     samples_buf = kmalloc(count, GFP_KERNEL);
     if (!samples_buf) {
         dev_err(&data->spi->dev, "Failed to allocate buffer for %zu samples\n", num_samples);
-        mutex_lock(&data->lock);
         data->sampling_active = false;
         mutex_unlock(&data->lock);
         return -ENOMEM;
     }
 
+    // Copy all mux_configs at once
     for (i = 0; i < num_samples; i++) {
-        mutex_lock(&data->lock);
         samples_buf[i].mux_config = data->mux_samples[i].mux_config;
-        mutex_unlock(&data->lock);
+    }
+    mutex_unlock(&data->lock);
+
+    for (i = 0; i < num_samples; i++) {
         ret = ads1256_read_sample(data, &samples_buf[i]);
         if (ret) {
             if (i > 0 && !copy_to_user(buf, samples_buf, i * sizeof(struct ads1256_mux_sample))) {
@@ -564,67 +577,31 @@ static ssize_t ads1256_read(struct file *filp, char __user *buf, size_t count, l
 static int ads1256_open(struct inode *inode, struct file *filp) {
     struct device *dev;
     struct ads1256_data *data;
-    struct spi_device *spi;
     dev_t devt;
-    int err;
 
-    pr_info("ads1256_open: inode=%p, i_cdev=%p, i_rdev=%u\n", inode, inode->i_cdev, (unsigned int)inode->i_rdev);
-
-    if (!inode->i_cdev) {
-        pr_err("Invalid inode or i_cdev in ads1256_open\n");
-        return -ENODEV;
-    }
-
-    // Try to get the device from the cdev's kobject parent using kernel's container_of_safe
-    // dev = container_of_safe(inode->i_cdev->kobj.parent, struct device, kobj);
-    dev = container_of(inode->i_cdev->kobj.parent, struct device, kobj);
-    pr_info("ads1256_open: kobj.parent=%p, dev=%p\n", inode->i_cdev->kobj.parent, dev);
-
+    spin_lock(&device_list_lock);  // Protect device lookup
+    devt = inode->i_rdev;
+    dev = class_find_device(ads1256_class, NULL, &devt, ads1256_devt_match);
     if (!dev) {
-        pr_err("Invalid device in inode, attempting recovery\n");
-        // Try to get the device from the device number (dev_t) using class_find_device, with safety checks
-        devt = inode->i_rdev;
-        if (!ads1256_class) {
-            pr_err("ads1256_class is NULL, cannot recover device\n");
-            return -ENODEV;
-        }
-        dev = class_find_device(ads1256_class, NULL, &devt, ads1256_devt_match);
-        if (!dev) {
-            pr_err("Failed to recover device from class, devt=0x%u\n", (unsigned int)devt);
-            return -ENODEV;
-        }
-        pr_info("ads1256_open: Recovered device from class: dev=%p, devt=0x%u\n", dev, (unsigned int)devt);
-        put_device(dev);  // Balance reference count from class_find_device
-    }
-
-    // First, try to get data from the device
-    data = dev_get_drvdata(dev);
-    if (!data) {
-        pr_err("Failed to get driver data from device\n");
-        // Try to get data from the SPI device directly
-        spi = to_spi_device(dev);
-        if (spi) {
-            data = spi_get_drvdata(spi);
-            if (!data) {
-                pr_err("Failed to get driver data from SPI device\n");
-                return -ENODEV;
-            }
-        } else {
-            pr_err("Failed to convert device to SPI device\n");
-            return -ENODEV;
-        }
-    }
-
-    // Verify SPI is valid before proceeding
-    if (!data->spi) {  // Only SPI is truly required
-        pr_err("Invalid driver data: spi=%p\n", data->spi);
+        spin_unlock(&device_list_lock);
+        pr_err("Failed to find device for devt=0x%u\n", (unsigned int)devt);
         return -ENODEV;
     }
 
-    err = 0;  // Initialize error code
+    data = dev_get_drvdata(dev);
+    if (!data || !data->spi) {
+        put_device(dev);  // Balance refcount
+        spin_unlock(&device_list_lock);
+        pr_err("Invalid driver data or SPI device\n");
+        return -ENODEV;
+    }
+
     filp->private_data = data;
-    pr_info("ads1256_open: Successfully opened with data=%p, err=%d\n", data, err);
-    return err;  // Return 0 on success, or propagate error
+    put_device(dev);  // Balance refcount
+    spin_unlock(&device_list_lock);
+
+    pr_info("ads1256_open: Successfully opened with data=%p\n", data);
+    return 0;
 }
 
 static long ads1256_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
@@ -655,7 +632,7 @@ static long ads1256_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
             mutex_unlock(&data->lock);
             return ret;
         }
-        data_rate = val;  // Update global for timeout calculation
+        data->data_rate = val;  // Update global for timeout calculation
         dev_info(&data->spi->dev, "Data rate set to 0x%x\n", val);
         break;
 
@@ -674,8 +651,26 @@ static long ads1256_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
             mutex_unlock(&data->lock);
             return ret;
         }
-        pga_gain = val;
+        data->pga_gain = val;
         dev_info(&data->spi->dev, "PGA gain set to 0x%x\n", val);
+        break;
+        
+    case ADS1256_SET_SENSOR_DETECT:
+        int sdcs;
+        if (copy_from_user(&sdcs, (int __user *)arg, sizeof(sdcs))) {
+            mutex_unlock(&data->lock);
+            return -EFAULT;
+        }
+        if (sdcs != ADS1256_ADCON_SDCS_0d5 && sdcs != ADS1256_ADCON_SDCS_2 && sdcs != ADS1256_ADCON_SDCS_10) {
+            mutex_unlock(&data->lock);
+            return -EINVAL;
+        }
+        ret = ads1256_write_reg(data, ADS1256_REG_ADCON, data->pga_gain | sdcs);
+        if (ret) {
+            mutex_unlock(&data->lock);
+            return ret;
+        }
+        dev_info(&data->spi->dev, "Sensor detect set to 0x%x\n", sdcs);
         break;
 
     default:
@@ -692,6 +687,18 @@ static int ads1256_release(struct inode *inode, struct file *filp) {
     return 0;
 }
 
+static unsigned int ads1256_poll(struct file *filp, struct poll_table_struct *wait) {
+    struct ads1256_data *data = filp->private_data;
+    unsigned int mask = 0;
+
+    mutex_lock(&data->lock);
+    poll_wait(filp, &data->wait, wait);
+    if (data->data_ready)
+        mask |= POLLIN | POLLRDNORM;
+    mutex_unlock(&data->lock);
+    return mask;
+}
+
 static const struct file_operations ads1256_fops = {
     .owner = THIS_MODULE,
     .read = ads1256_read,
@@ -699,7 +706,57 @@ static const struct file_operations ads1256_fops = {
     .open = ads1256_open,
     .unlocked_ioctl = ads1256_ioctl,
     .release = ads1256_release,
+    .poll = ads1256_poll,
 };
+
+static irqreturn_t ads1256_drdy_handler(int irq, void *dev_id) {
+    struct ads1256_data *data = dev_id;
+    data->data_ready = true;
+    wake_up_interruptible(&data->wait);
+    return IRQ_HANDLED;
+}
+
+static ssize_t current_sample_show(struct device *dev, struct device_attribute *attr, char *buf) {
+    struct ads1256_data *data = dev_get_drvdata(dev);
+    ssize_t ret;
+
+    mutex_lock(&data->lock);
+    ret = snprintf(buf, PAGE_SIZE, "0x%08x at %llu ns\n", data->last_sample.value, data->last_sample.timestamp);
+    mutex_unlock(&data->lock);
+    return ret;
+}
+static DEVICE_ATTR_RO(current_sample);
+
+static ssize_t last_sample_show(struct device *dev, struct device_attribute *attr, char *buf) {
+    struct ads1256_data *data = dev_get_drvdata(dev);
+    struct ads1256_mux_sample sample = { .mux_config = ADS1256_MUX_RESET };
+    int ret;
+
+    ret = ads1256_read_sample(data, &sample);
+    if (ret)
+        return ret;
+
+    return snprintf(buf, PAGE_SIZE, "0x%08x at %llu ns\n", sample.value, sample.timestamp);
+}
+static DEVICE_ATTR_RO(last_sample);
+
+static ssize_t calibrate_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
+    struct ads1256_data *data = dev_get_drvdata(dev);
+    u8 selfcal_cmd = ADS1256_CMD_SELFCAL;
+    int ret;
+
+    mutex_lock(&data->lock);
+    ret = ads1256_spi_transfer(data, &selfcal_cmd, NULL, 1);
+    if (ret) {
+        dev_err(&data->spi->dev, "Calibration failed: %d\n", ret);
+    } else {
+        usleep_range(500, 1000);
+        dev_info(&data->spi->dev, "Calibration triggered\n");
+    }
+    mutex_unlock(&data->lock);
+    return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(calibrate);
 
 static int ads1256_sync_all(void) {
     int ret = 0, i;
@@ -747,55 +804,6 @@ static void ads1256_sync_work_handler(struct work_struct *work) {
     }
 }
 
-static irqreturn_t ads1256_drdy_handler(int irq, void *dev_id) {
-    struct ads1256_data *data = dev_id;
-    data->data_ready = true;
-    wake_up_interruptible(&data->wait);
-    return IRQ_HANDLED;
-}
-
-static ssize_t current_sample_show(struct device *dev, struct device_attribute *attr, char *buf) {
-    struct ads1256_data *data = dev_get_drvdata(dev);
-    int ret;
-
-    mutex_lock(&data->lock);
-    ret = sprintf(buf, "0x%08x at %llu ns\n", data->last_sample.value, data->last_sample.timestamp);
-    mutex_unlock(&data->lock);
-    return ret;
-}
-static DEVICE_ATTR_RO(current_sample);
-
-static ssize_t last_sample_show(struct device *dev, struct device_attribute *attr, char *buf) {
-    struct ads1256_data *data = dev_get_drvdata(dev);
-    struct ads1256_mux_sample sample = { .mux_config = ADS1256_MUX_RESET };
-    int ret;
-
-    ret = ads1256_read_sample(data, &sample);
-    if (ret)
-        return ret;
-
-    return sprintf(buf, "0x%08x at %llu ns\n", sample.value, sample.timestamp);
-}
-static DEVICE_ATTR_RO(last_sample);
-
-static ssize_t calibrate_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
-    struct ads1256_data *data = dev_get_drvdata(dev);
-    u8 selfcal_cmd = ADS1256_CMD_SELFCAL;
-    int ret;
-
-    mutex_lock(&data->lock);
-    ret = ads1256_spi_transfer(data, &selfcal_cmd, NULL, 1);
-    if (ret) {
-        dev_err(&data->spi->dev, "Calibration failed: %d\n", ret);
-    } else {
-        usleep_range(500, 1000);
-        dev_info(&data->spi->dev, "Calibration triggered\n");
-    }
-    mutex_unlock(&data->lock);
-    return ret ? ret : count;
-}
-static DEVICE_ATTR_WO(calibrate);
-
 static ssize_t sync_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
     int ret = ads1256_sync_all();
     if (ret) {
@@ -804,6 +812,84 @@ static ssize_t sync_store(struct device *dev, struct device_attribute *attr, con
     return count;
 }
 static DEVICE_ATTR_WO(sync);
+
+static ssize_t data_rate_show(struct device *dev, struct device_attribute *attr, char *buf) {
+    struct ads1256_data *data = dev_get_drvdata(dev);
+    ssize_t ret;
+    mutex_lock(&data->lock);
+    ret = snprintf(buf, PAGE_SIZE, "0x%02x\n", data->data_rate);
+    mutex_unlock(&data->lock);
+    return ret;
+}
+
+static ssize_t data_rate_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
+    struct ads1256_data *data = dev_get_drvdata(dev);
+    unsigned int val;
+    int ret;
+
+    if (kstrtouint(buf, 16, &val) < 0)
+        return -EINVAL;
+
+    mutex_lock(&data->lock);
+    if (data->sampling_active) {
+        mutex_unlock(&data->lock);
+        dev_err(&data->spi->dev, "Cannot change data rate during active sampling\n");
+        return -EBUSY;
+    }
+    if (!is_valid_drate(val)) {
+        mutex_unlock(&data->lock);
+        dev_err(&data->spi->dev, "Invalid data rate: 0x%x\n", val);
+        return -EINVAL;
+    }
+    ret = ads1256_write_reg(data, ADS1256_REG_DRATE, val);
+    if (ret) {
+        mutex_unlock(&data->lock);
+        return ret;
+    }
+    data->data_rate = val;
+    mutex_unlock(&data->lock);
+    return count;
+}
+static DEVICE_ATTR_RW(data_rate);
+
+static ssize_t pga_gain_show(struct device *dev, struct device_attribute *attr, char *buf) {
+    struct ads1256_data *data = dev_get_drvdata(dev);
+    ssize_t ret;
+    mutex_lock(&data->lock);
+    ret = snprintf(buf, PAGE_SIZE, "0x%02x\n", data->pga_gain);
+    mutex_unlock(&data->lock);
+    return ret;
+}
+
+static ssize_t pga_gain_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
+    struct ads1256_data *data = dev_get_drvdata(dev);
+    unsigned int val;
+    int ret;
+
+    if (kstrtouint(buf, 16, &val) < 0)
+        return -EINVAL;
+
+    mutex_lock(&data->lock);
+    if (data->sampling_active) {
+        mutex_unlock(&data->lock);
+        dev_err(&data->spi->dev, "Cannot change PGA gain during active sampling\n");
+        return -EBUSY;
+    }
+    if (!is_valid_pga(val)) {
+        mutex_unlock(&data->lock);
+        dev_err(&data->spi->dev, "Invalid PGA gain: 0x%x\n", val);
+        return -EINVAL;
+    }
+    ret = ads1256_write_reg(data, ADS1256_REG_ADCON, val);
+    if (ret) {
+        mutex_unlock(&data->lock);
+        return ret;
+    }
+    data->pga_gain = val;
+    mutex_unlock(&data->lock);
+    return count;
+}
+static DEVICE_ATTR_RW(pga_gain);
 
 static int ads1256_probe(struct spi_device *spi) {
     struct ads1256_data *data;
@@ -830,9 +916,12 @@ static int ads1256_probe(struct spi_device *spi) {
     mutex_init(&data->lock);
     data->mux_samples = NULL;
     data->num_samples = 0;
-    data->last_sample.mux_config = ADS1256_MUX_RESET;  // Default MUX
-    data->last_sample.value = 0;                       // Default value
-    data->last_sample.timestamp = 0;                   // Default timestamp
+    data->last_sample.mux_config = ADS1256_MUX_RESET;   // Default MUX
+    data->last_sample.value = 0;                        // Default value
+    data->last_sample.timestamp = 0;                    // Default timestamp
+    data->data_rate = ADS1256_DRATE_SPS_30000;          // Default value
+    data->pga_gain = ADS1256_ADCON_PGA_1;               // Default value
+    data->sampling_active = false;  // Add this line after other initializations
     spi_set_drvdata(spi, data);
 
     // DRDY GPIO setup
@@ -873,6 +962,16 @@ static int ads1256_probe(struct spi_device *spi) {
     }
     data->sync_gpio = shared_sync_gpio;  // Assign shared GPIO to this instance
     mutex_unlock(&sync_mutex);
+
+    // Reset GPIO setup (optional)
+    data->reset_gpio = devm_gpiod_get_optional(&spi->dev, "reset", GPIOD_OUT_HIGH);
+    if (IS_ERR(data->reset_gpio)) {
+        ret = PTR_ERR(data->reset_gpio);
+        dev_warn(&spi->dev, "Failed to get reset GPIO: %d, falling back to software reset\n", ret);
+        data->reset_gpio = NULL;
+    } else if (data->reset_gpio) {
+        dev_info(&spi->dev, "Reset GPIO retrieved: %p\n", data->reset_gpio);
+    }
 
     // SPI setup
     // Force SPI mode 1 (CPOL=0, CPHA=1) as per ADS1256 datasheet
@@ -960,6 +1059,14 @@ static int ads1256_probe(struct spi_device *spi) {
         dev_warn(&spi->dev, "Failed to create sync sysfs: %d\n", ret);
     }
 
+    ret = device_create_file(data->device, &dev_attr_data_rate);
+    if (ret)
+        dev_warn(&data->spi->dev, "Failed to create data_rate sysfs: %d\n", ret);
+
+    ret = device_create_file(data->device, &dev_attr_pga_gain);
+    if (ret)
+        dev_warn(&data->spi->dev, "Failed to create pga_gain sysfs: %d\n", ret);
+
     // Initialize and configure the ADS1256
     ret = ads1256_reset(data);
     if (ret) {
@@ -1002,6 +1109,7 @@ static int ads1256_probe(struct spi_device *spi) {
 
     dev_info(&spi->dev, "ADS1256 on SPI%d initialized, device %s created\n", bus_num, dev_name);
     kobject_uevent(&data->device->kobj, KOBJ_ADD);
+    atomic_inc(&ads1256_device_count);  // Add this line to track active devices
     return 0;
 
 err_init:
@@ -1049,6 +1157,8 @@ static int ads1256_remove(struct spi_device *spi) {
             if (data->sysfs_calibrate)
                 device_remove_file(data->device, &dev_attr_calibrate);
             device_remove_file(data->device, &dev_attr_current_sample);  // Always attempt, safe if not present
+            device_remove_file(data->device, &dev_attr_data_rate);
+            device_remove_file(data->device, &dev_attr_pga_gain);
             device_destroy(ads1256_class, data->devt);  // Use per-device devt
             data->device = NULL;  // Prevent double-destroy
         }
@@ -1104,14 +1214,6 @@ static struct spi_driver ads1256_driver = {
 };
 
 static int __init ads1256_init(void) {
-    if (!is_valid_drate(data_rate)) {
-        pr_err("Invalid data_rate: 0x%x, using default 0x%x\n", data_rate, ADS1256_DRATE_SPS_30000);
-        data_rate = ADS1256_DRATE_SPS_30000;
-    }
-    if (!is_valid_pga(pga_gain)) {
-        pr_err("Invalid pga_gain: 0x%x, using default 0x%x\n", pga_gain, ADS1256_ADCON_PGA_1);
-        pga_gain = ADS1256_ADCON_PGA_1;
-    }
     return spi_register_driver(&ads1256_driver);
 }
 
