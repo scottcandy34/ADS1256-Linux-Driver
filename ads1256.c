@@ -132,7 +132,8 @@ static struct cdev ads1256_cdev;  // Add cdev for manual management
 static int ads1256_devt_match(struct device *dev, const void *data)
 {
     dev_t target = *(dev_t *)data;
-    pr_info("Matching dev=%p, devt=0x%u, target=0x%u\n", dev, (unsigned int)dev->devt, (unsigned int)target);
+    // pr_info("Matching dev=%p, devt=0x%u, target=0x%u\n", dev, (unsigned int)dev->devt, (unsigned int)target);
+    pr_info("Matching dev=%p, devt=0x%llu, target=0x%llu\n", dev, (unsigned long long)dev->devt, (unsigned long long)target);
     return dev && dev->devt == target;
 }
 
@@ -159,9 +160,9 @@ static int ads1256_write_reg(struct ads1256_data *data, u8 reg, u8 value)
 }
 
 /* Read from ADS1256 Register */
-static u8 ads1256_read_reg(struct ads1256_data *data, u8 reg)
+static u8 __attribute__((unused)) ads1256_read_reg(struct ads1256_data *data, u8 reg)
 {
-    u8 tx_buf[2] = { ADS1256_CMD_RREG | reg, 0x00 };
+    u8 tx_buf[2] = { ADS1256_CMD_RREG | reg, ADS1256_REG_secdCMD };
     u8 rx_buf[2] = { 0 };
     ads1256_spi_transfer(data, tx_buf, rx_buf, 2);
     return rx_buf[1];
@@ -169,30 +170,26 @@ static u8 ads1256_read_reg(struct ads1256_data *data, u8 reg)
 
 // Reset the ADS1256
 static int ads1256_reset(struct ads1256_data *data) {
-    int ret;
+    int ret = 0;
     u8 reset_cmd = ADS1256_CMD_RESET;
     u8 sdatac_cmd = ADS1256_CMD_SDATAC;
 
     mutex_lock(&data->lock);
     ret = ads1256_spi_transfer(data, &reset_cmd, NULL, 1);
-    if (ret == 0) {
-        // Wait after reset (per datasheet, 0.5 ms minimum) using usleep_range for robustness
-        usleep_range(500, 1000);  // Sleep 500-1000 us (0.5-1 ms)
-        dev_info(&data->spi->dev, "ADS1256 reset successful\n");
-    } else {
+    if (ret) {
         dev_err(&data->spi->dev, "ADS1256 reset failed: %d\n", ret);
         goto out;
     }
+    usleep_range(500, 1000);
 
     ret = ads1256_spi_transfer(data, &sdatac_cmd, NULL, 1);
-    if (ret == 0) {
-        // Wait after reset (per datasheet, 0.5 ms minimum) using usleep_range for robustness
-        usleep_range(500, 1000);  // Sleep 500-1000 us (0.5-1 ms)
-        dev_info(&data->spi->dev, "ADS1256 stop read data continuously successful\n");
-    } else {
+    if (ret) {
         dev_err(&data->spi->dev, "ADS1256 stop read data continuously failed: %d\n", ret);
         goto out;
     }
+    usleep_range(500, 1000);
+
+    dev_info(&data->spi->dev, "ADS1256 reset successful\n");
 out:
     mutex_unlock(&data->lock);
     return ret;
@@ -201,6 +198,7 @@ out:
 // Configure the ADS1256
 static int ads1256_configure(struct ads1256_data *data) {
     int ret;
+    u8 selfcal_cmd = ADS1256_CMD_SELFCAL;
 
     mutex_lock(&data->lock);
     // Set STATUS Reg with buffer on.
@@ -232,7 +230,6 @@ static int ads1256_configure(struct ads1256_data *data) {
     }
 
     // Start conversions
-    u8 selfcal_cmd = ADS1256_CMD_SELFCAL;
     ret = ads1256_spi_transfer(data, &selfcal_cmd, NULL, 1);
     if (ret == 0) {
         // Wait after reset (per datasheet, 0.5 ms minimum) using usleep_range for robustness
@@ -252,36 +249,46 @@ out:
 // Read one sample from channel 0, with DRDY polling
 static int ads1256_read_sample(struct ads1256_data *data, u32 *value) {
     int ret;
-    int timeout = 1000;  // 1 second timeout (adjust as needed)
-
-    // Poll DRDY (active-low, so wait for it to go low)
-    while (gpiod_get_value_cansleep(data->drdy_gpio) && timeout--) {
-        usleep_range(1000, 2000);  // Wait 1-2 ms per check
-    }
-    if (timeout <= 0) {
-        dev_err(&data->spi->dev, "DRDY timeout waiting for data ready\n");
-        return -ETIMEDOUT;
-    }
-    dev_info(&data->spi->dev, "DRDY asserted, proceeding to read\n");
+    int timeout = ADS1256_DRDY_TIMEOUT / 1000;  // Convert to iterations (33 iterations at 1 ms)
+    u8 rdata_cmd = ADS1256_CMD_RDATA;
 
     mutex_lock(&data->lock);
+    // Poll DRDY (active-low, so wait for it to go low)
+    if (data->drdy_gpio) {
+        while (gpiod_get_value_cansleep(data->drdy_gpio) && timeout--) {
+            usleep_range(1000, 2000);
+        }
+        if (timeout <= 0) {
+            dev_err(&data->spi->dev, "DRDY timeout waiting for data ready\n");
+            ret = -ETIMEDOUT;
+            goto out;
+        }
+    } else {
+        usleep_range(ADS1256_DRDY_TIMEOUT, ADS1256_DRDY_TIMEOUT + 1000);  // Fixed delay
+        dev_dbg(&data->spi->dev, "No DRDY GPIO, using fixed delay\n");
+    }
+    dev_dbg(&data->spi->dev, "DRDY asserted, proceeding to read\n");
 
     // Send RDATA command
-    dev_info(&data->spi->dev, "Sending RDATA command, TX buffer: 0x%02x\n", data->tx_buf[0]);
-    u8 rdata_cmd = ADS1256_CMD_RDATA;
-    ret = ads1256_spi_transfer(data, &rdata_cmd, data->rx_buf, 4);
-    if (ret == 0) {
-        // Combine 3 bytes into 24-bit value (two's complement for signed value)
-        *value = (data->rx_buf[0] << 16) | (data->rx_buf[1] << 8) | data->rx_buf[2];
-        // if (*value & 0x800000) {  // Handle negative values (two's complement)
-        //     *value |= 0xFF000000;  // Sign-extend to 32 bits
-        // }
-        dev_info(&data->spi->dev, "Read sample: 0x%08x (raw: 0x%02x 0x%02x 0x%02x)\n",
-                 *value, data->rx_buf[0], data->rx_buf[1], data->rx_buf[2]);
-    } else {
-        dev_err(&data->spi->dev, "SPI sync failed: %d\n", ret);
+    dev_dbg(&data->spi->dev, "Sending RDATA command, TX buffer: 0x%02x\n", data->tx_buf[0]);
+    ret = ads1256_spi_transfer(data, &rdata_cmd, NULL, 1);
+    if (ret) {
+        dev_err(&data->spi->dev, "Failed to send RDATA: %d\n", ret);
         goto out;
     }
+
+    ret = ads1256_spi_transfer(data, NULL, data->rx_buf, 3);
+    if (ret) {
+        dev_err(&data->spi->dev, "SPI read failed: %d\n", ret);
+        goto out;
+    }
+
+    *value = (data->rx_buf[0] << 16) | (data->rx_buf[1] << 8) | data->rx_buf[2];
+    if (*value & 0x800000) {
+        *value |= 0xFF000000;  // Sign-extend to 32 bits
+    }
+    dev_dbg(&data->spi->dev, "Read sample: %d (0x%08x, raw: 0x%02x 0x%02x 0x%02x)\n",
+            (int32_t)*value, *value, data->rx_buf[0], data->rx_buf[1], data->rx_buf[2]);
 
 out:
     mutex_unlock(&data->lock);
@@ -309,7 +316,7 @@ static ssize_t ads1256_read(struct file *filp, char __user *buf, size_t count, l
         return -EFAULT;
     }
 
-    dev_info(&data->spi->dev, "Successfully read sample 0x%08x to user space\n", sample);
+    dev_dbg(&data->spi->dev, "Successfully read sample 0x%08x to user space\n", sample);
     return sizeof(u32);
 }
 
@@ -328,7 +335,8 @@ static int ads1256_open(struct inode *inode, struct file *filp) {
     }
 
     // Try to get the device from the cdev's kobject parent using kernel's container_of_safe
-    dev = container_of_safe(inode->i_cdev->kobj.parent, struct device, kobj);
+    // dev = container_of_safe(inode->i_cdev->kobj.parent, struct device, kobj);
+    dev = container_of(inode->i_cdev->kobj.parent, struct device, kobj);
     pr_info("ads1256_open: kobj.parent=%p, dev=%p\n", inode->i_cdev->kobj.parent, dev);
 
     if (!dev) {
@@ -384,6 +392,16 @@ static const struct file_operations ads1256_fops = {
     .open = ads1256_open,
 };
 
+static ssize_t last_sample_show(struct device *dev, struct device_attribute *attr, char *buf) {
+    struct ads1256_data *data = dev_get_drvdata(dev);
+    u32 sample;
+    int ret = ads1256_read_sample(data, &sample);
+    if (ret)
+        return ret;
+    return sprintf(buf, "0x%08x\n", sample);
+}
+static DEVICE_ATTR_RO(last_sample);
+
 static int ads1256_probe(struct spi_device *spi) {
     struct ads1256_data *data;
     int ret;
@@ -402,11 +420,10 @@ static int ads1256_probe(struct spi_device *spi) {
     spi_set_drvdata(spi, data);
 
     // Get DRDY GPIO from device tree (e.g., named "drdy")
-    data->drdy_gpio = gpiod_get(&spi->dev, "drdy", GPIOD_IN);
+    data->drdy_gpio = devm_gpiod_get(&spi->dev, "drdy", GPIOD_IN);
     if (IS_ERR(data->drdy_gpio)) {
-        dev_err(&spi->dev, "Failed to get DRDY GPIO: %ld\n", PTR_ERR(data->drdy_gpio));
-        ret = PTR_ERR(data->drdy_gpio);
-        goto err_free_data;
+        dev_warn(&spi->dev, "DRDY GPIO not found, using delay-based polling\n");
+        data->drdy_gpio = NULL;
     }
     dev_info(&spi->dev, "DRDY GPIO retrieved: %p\n", data->drdy_gpio);
 
@@ -421,7 +438,7 @@ static int ads1256_probe(struct spi_device *spi) {
     ret = spi_setup(spi);
     if (ret) {
         dev_err(&spi->dev, "SPI setup with mode 1 failed: %d\n", ret);
-        goto err_put_drdy;
+        return ret;
     }
     dev_info(&spi->dev, "SPI setup succeeded with mode 1\n");
 
@@ -488,6 +505,10 @@ static int ads1256_probe(struct spi_device *spi) {
     }
     dev_info(&spi->dev, "Device created: %p, major=%d, minor=0\n", ads1256_device, ads1256_major);
 
+    ret = device_create_file(ads1256_device, &dev_attr_last_sample);
+    if (ret)
+        dev_warn(&spi->dev, "Failed to create sysfs file: %d\n", ret);
+
     // Store the driver data in the device for later retrieval
     dev_set_drvdata(ads1256_device, data);
 
@@ -519,9 +540,6 @@ err_unreg_chrdev:
 err_put_drdy:
     if (data->drdy_gpio)
         gpiod_put(data->drdy_gpio);
-err_free_data:
-    spi_set_drvdata(spi, NULL);
-    devm_kfree(&spi->dev, data);
     return ret;
 }
 
@@ -536,7 +554,8 @@ static int ads1256_remove(struct spi_device *spi) {
         cdev_del(&ads1256_cdev);  // Clean up cdev
         unregister_chrdev(ads1256_major, ADS1256_NAME);
     }
-	// dev_info(&spi->dev, "ADS1256_%d removed\n", data->index);
+    spi_set_drvdata(spi, NULL);
+	dev_info(&spi->dev, "ADS1256 removed\n");
     return 0;  // Return an int to match the spi_driver.remove signature
 }
 
@@ -546,10 +565,17 @@ static const struct spi_device_id ads1256_id[] = {
 };
 MODULE_DEVICE_TABLE(spi, ads1256_id);
 
+static const struct of_device_id ads1256_of_match[] = {
+    { .compatible = "ti,ads1256" },
+    { }
+};
+MODULE_DEVICE_TABLE(of, ads1256_of_match);
+
 static struct spi_driver ads1256_driver = {
     .driver = {
         .name = ADS1256_NAME,
         .owner = THIS_MODULE,
+        .of_match_table = ads1256_of_match,
     },
     .probe = ads1256_probe,
     .remove = ads1256_remove,
