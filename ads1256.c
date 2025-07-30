@@ -14,6 +14,7 @@
 #include <linux/ktime.h>            // For timestamps
 #include <linux/workqueue.h>
 #include <linux/poll.h>
+#include <linux/slab.h>
 
 // Define constants
 #define ADS1256_NAME "ads1256"
@@ -206,7 +207,9 @@ struct ads1256_data {
     struct ads1256_mux_sample last_sample;
     struct cdev cdev;           // Per-device cdev
     struct device *device;      // Per-device device pointer
-    int dev_num;                // SPI bus number (0, 3, 4, 5, 6)
+    int bus_num;    // SPI bus number (0, 3, 4, 5, 6)
+    int cs_num;     // Chip select number (e.g., 0, 1, 2)
+    int dev_minor;  // Unique minor number for device
     dev_t devt;                 // Device number (major + minor)
     int data_rate;  // Per-device data rate
     int pga_gain;   // Per-device PGA gain
@@ -328,14 +331,14 @@ static int ads1256_configure(struct ads1256_data *data) {
         goto out;
     }
 
-    // Start conversions
+    // Perform self-calibration
     ret = ads1256_spi_transfer(data, &selfcal_cmd, NULL, 1);
     if (ret) {
         dev_err(&data->spi->dev, "Failed self calibration: %d\n", ret);
         goto out;
     }
-
     usleep_range(500, 1000);
+    
     dev_info(&data->spi->dev, "ADS1256 configured: DRATE=0x%02x, PGA=0x%02x\n", data->data_rate, data->pga_gain);
 out:
     mutex_unlock(&data->lock);
@@ -412,14 +415,17 @@ static int ads1256_read_sample(struct ads1256_data *data, struct ads1256_mux_sam
         sample->timestamp = ktime_get_ns();
         return -EINVAL;
     }
-    if (debug)
-        dev_dbg(&data->spi->dev, "DRDY asserted, proceeding to read\n");
+    if (debug) {
+        dev_dbg(&data->spi->dev, "DRDY asserted, reading sample for MUX 0x%02x\n", sample->mux_config);
+    }
     
-    mutex_lock(&data->lock);  // Re-acquire lock for SPI transfer
+    // Re-acquire lock for SPI transfer
+    if (mutex_lock_interruptible(&data->lock)) {
+        sample->timestamp = ktime_get_ns();
+        return -EINTR;
+    }
 
     // Send RDATA command
-    if (debug)
-        dev_dbg(&data->spi->dev, "Sending RDATA command: 0x%02x\n", rdata_cmd);
     ret = ads1256_spi_transfer(data, &rdata_cmd, NULL, 1);
     if (ret) {
         dev_err(&data->spi->dev, "Failed to send RDATA: %d\n", ret);
@@ -440,9 +446,9 @@ static int ads1256_read_sample(struct ads1256_data *data, struct ads1256_mux_sam
     }
     sample->timestamp = ktime_get_ns();  // Capture timestamp in nanoseconds
     data->last_sample = *sample;  // Store the entire sample
-    if (debug)
-        dev_dbg(&data->spi->dev, "Read sample for MUX 0x%02x: %d (0x%08x) at %llu ns\n",
-                sample->mux_config, (int32_t)sample->value, sample->value, sample->timestamp);
+    if (debug) {
+        dev_dbg(&data->spi->dev, "Sample read: value=0x%08x at %llu ns\n", sample->value, sample->timestamp);
+    }
 
 out:
     mutex_unlock(&data->lock);
@@ -461,7 +467,7 @@ static ssize_t ads1256_write(struct file *filp, const char __user *buf, size_t c
         return -EINVAL;
     }
 
-    new_samples = kmalloc(count, GFP_KERNEL);
+    new_samples = kmalloc_array(num_samples, sizeof(struct ads1256_mux_sample), GFP_KERNEL);
     if (!new_samples) {
         dev_err(&data->spi->dev, "Failed to allocate buffer for %zu samples\n", num_samples);
         return -ENOMEM;
@@ -597,8 +603,8 @@ static int ads1256_open(struct inode *inode, struct file *filp) {
     }
 
     filp->private_data = data;
-    put_device(dev);  // Balance refcount
     spin_unlock(&device_list_lock);
+    put_device(dev);  // Balance refcount
 
     pr_info("ads1256_open: Successfully opened with data=%p\n", data);
     return 0;
@@ -617,66 +623,67 @@ static long ads1256_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
     }
 
     switch (cmd) {
-    case ADS1256_SET_DATA_RATE:
-        if (copy_from_user(&val, (int __user *)arg, sizeof(val))) {
-            mutex_unlock(&data->lock);
-            return -EFAULT;
-        }
-        if (!is_valid_drate(val)) {
-            dev_err(&data->spi->dev, "Invalid data rate: 0x%x\n", val);
-            mutex_unlock(&data->lock);
-            return -EINVAL;
-        }
-        ret = ads1256_write_reg(data, ADS1256_REG_DRATE, val);
-        if (ret) {
-            mutex_unlock(&data->lock);
-            return ret;
-        }
-        data->data_rate = val;  // Update global for timeout calculation
-        dev_info(&data->spi->dev, "Data rate set to 0x%x\n", val);
-        break;
+        case ADS1256_SET_DATA_RATE:
+            if (copy_from_user(&val, (int __user *)arg, sizeof(val))) {
+                mutex_unlock(&data->lock);
+                return -EFAULT;
+            }
+            if (!is_valid_drate(val)) {
+                dev_err(&data->spi->dev, "Invalid data rate: 0x%x\n", val);
+                mutex_unlock(&data->lock);
+                return -EINVAL;
+            }
+            ret = ads1256_write_reg(data, ADS1256_REG_DRATE, val);
+            if (ret) {
+                mutex_unlock(&data->lock);
+                return ret;
+            }
+            data->data_rate = val;  // Update global for timeout calculation
+            dev_info(&data->spi->dev, "Data rate set to 0x%x\n", val);
+            break;
 
-    case ADS1256_SET_PGA_GAIN:
-        if (copy_from_user(&val, (int __user *)arg, sizeof(val))) {
-            mutex_unlock(&data->lock);
-            return -EFAULT;
-        }
-        if (!is_valid_pga(val)) {
-            dev_err(&data->spi->dev, "Invalid PGA gain: 0x%x\n", val);
-            mutex_unlock(&data->lock);
-            return -EINVAL;
-        }
-        ret = ads1256_write_reg(data, ADS1256_REG_ADCON, val);
-        if (ret) {
-            mutex_unlock(&data->lock);
-            return ret;
-        }
-        data->pga_gain = val;
-        dev_info(&data->spi->dev, "PGA gain set to 0x%x\n", val);
-        break;
-        
-    case ADS1256_SET_SENSOR_DETECT:
-        int sdcs;
-        if (copy_from_user(&sdcs, (int __user *)arg, sizeof(sdcs))) {
-            mutex_unlock(&data->lock);
-            return -EFAULT;
-        }
-        if (sdcs != ADS1256_ADCON_SDCS_0d5 && sdcs != ADS1256_ADCON_SDCS_2 && sdcs != ADS1256_ADCON_SDCS_10) {
-            mutex_unlock(&data->lock);
-            return -EINVAL;
-        }
-        ret = ads1256_write_reg(data, ADS1256_REG_ADCON, data->pga_gain | sdcs);
-        if (ret) {
-            mutex_unlock(&data->lock);
-            return ret;
-        }
-        dev_info(&data->spi->dev, "Sensor detect set to 0x%x\n", sdcs);
-        break;
+        case ADS1256_SET_PGA_GAIN:
+            if (copy_from_user(&val, (int __user *)arg, sizeof(val))) {
+                mutex_unlock(&data->lock);
+                return -EFAULT;
+            }
+            if (!is_valid_pga(val)) {
+                dev_err(&data->spi->dev, "Invalid PGA gain: 0x%x\n", val);
+                mutex_unlock(&data->lock);
+                return -EINVAL;
+            }
+            ret = ads1256_write_reg(data, ADS1256_REG_ADCON, val);
+            if (ret) {
+                mutex_unlock(&data->lock);
+                return ret;
+            }
+            data->pga_gain = val;
+            dev_info(&data->spi->dev, "PGA gain set to 0x%x\n", val);
+            break;
+            
+        case ADS1256_SET_SENSOR_DETECT:
+            int sdcs;
+            if (copy_from_user(&sdcs, (int __user *)arg, sizeof(sdcs))) {
+                mutex_unlock(&data->lock);
+                return -EFAULT;
+            }
+            if (sdcs != ADS1256_ADCON_SDCS_0d5 && sdcs != ADS1256_ADCON_SDCS_2 && sdcs != ADS1256_ADCON_SDCS_10) {
+                mutex_unlock(&data->lock);
+                return -EINVAL;
+            }
+            ret = ads1256_write_reg(data, ADS1256_REG_ADCON, data->pga_gain | sdcs);
+            if (ret) {
+                mutex_unlock(&data->lock);
+                return ret;
+            }
+            dev_info(&data->spi->dev, "Sensor detect set to 0x%x\n", sdcs);
+            break;
 
-    default:
-        mutex_unlock(&data->lock);
-        return -ENOTTY;
+        default:
+            mutex_unlock(&data->lock);
+            return -ENOTTY;
     }
+
     mutex_unlock(&data->lock);
     return 0;
 }
@@ -723,6 +730,8 @@ static ssize_t current_sample_show(struct device *dev, struct device_attribute *
     mutex_lock(&data->lock);
     ret = snprintf(buf, PAGE_SIZE, "0x%08x at %llu ns\n", data->last_sample.value, data->last_sample.timestamp);
     mutex_unlock(&data->lock);
+    if (ret >= PAGE_SIZE || ret < 0)
+        return -EIO;  // Buffer too small or error
     return ret;
 }
 static DEVICE_ATTR_RO(current_sample);
@@ -758,8 +767,38 @@ static ssize_t calibrate_store(struct device *dev, struct device_attribute *attr
 }
 static DEVICE_ATTR_WO(calibrate);
 
+// Callback function for class_for_each_device
+static int ads1256_sync_device(struct device *dev, void *data) {
+    struct ads1256_data *ads_data = dev_get_drvdata(dev);
+    u8 *sync_cmd = data;
+    int err;
+
+    if (!ads_data || (ads_data->bus_num != 0 && ads_data->bus_num != 3 &&
+                      ads_data->bus_num != 4 && ads_data->bus_num != 5 &&
+                      ads_data->bus_num != 6)) {
+        return 0;  // Skip invalid or non-matching devices
+    }
+
+    if (!mutex_trylock(&ads_data->lock)) {
+        dev_warn(&ads_data->spi->dev, "Skipping sync on SPI%d CS%d: device busy\n",
+                 ads_data->bus_num, ads_data->cs_num);
+        return 0;  // Skip locked devices
+    }
+
+    err = ads1256_spi_transfer(ads_data, sync_cmd, NULL, 1);
+    if (err) {
+        dev_err(&ads_data->spi->dev, "Failed to send SYNC on SPI%d CS%d: %d\n",
+                ads_data->bus_num, ads_data->cs_num, err);
+    } else {
+        dev_info(&ads_data->spi->dev, "Synchronization triggered on SPI%d CS%d\n",
+                 ads_data->bus_num, ads_data->cs_num);
+    }
+    mutex_unlock(&ads_data->lock);
+    return err;
+}
+
 static int ads1256_sync_all(void) {
-    int ret = 0, i;
+    int ret = 0, sync_errors = 0;
     u8 sync_cmd = ADS1256_CMD_SYNC;
 
     mutex_lock(&sync_mutex);
@@ -774,25 +813,19 @@ static int ads1256_sync_all(void) {
     gpiod_set_value_cansleep(shared_sync_gpio, 1);
     usleep_range(10, 20);
 
-    spin_lock(&device_list_lock);
-    for (i = 0; i < MAX_ADS1256_DEVICES; i++) {
-        struct ads1256_data *data = ads1256_devices[i];
-        if (data) {
-            mutex_lock(&data->lock);
-            ret = ads1256_spi_transfer(data, &sync_cmd, NULL, 1);
-            if (ret) {
-                dev_err(&data->spi->dev, "Failed to send SYNC command on SPI%d: %d\n", data->dev_num, ret);
-            } else {
-                dev_info(&data->spi->dev, "Synchronization triggered on SPI%d\n", data->dev_num);
-            }
-            mutex_unlock(&data->lock);
-            if (ret) break;
-        }
+    // Sync all devices in the class
+    ret = class_for_each_device(ads1256_class, NULL, &sync_cmd, ads1256_sync_device);
+    if (ret) {
+        sync_errors++;  // Count errors from callback
     }
-    spin_unlock(&device_list_lock);
 
     mutex_unlock(&sync_mutex);
-    return ret;
+    if (sync_errors) {
+        pr_err("Synchronization failed for %d devices\n", sync_errors);
+        return ret;
+    }
+    pr_info("Synchronization completed for %d devices\n", atomic_read(&ads1256_device_count));
+    return 0;
 }
 
 static void ads1256_sync_work_handler(struct work_struct *work) {
@@ -903,6 +936,7 @@ static int ads1256_probe(struct spi_device *spi) {
         dev_err(&spi->dev, "Unsupported SPI bus %d (only 0, 3, 4, 5, 6 allowed)\n", bus_num);
         return -EINVAL;
     }
+
 	
 	/* Allocate device data */
     data = devm_kzalloc(&spi->dev, sizeof(*data), GFP_KERNEL);
@@ -912,7 +946,9 @@ static int ads1256_probe(struct spi_device *spi) {
     }
 
     data->spi = spi;
-    data->dev_num = bus_num;
+    data->bus_num = bus_num;
+    data->cs_num = spi->chip_select;
+    data->device = NULL;
     mutex_init(&data->lock);
     data->mux_samples = NULL;
     data->num_samples = 0;
@@ -921,7 +957,7 @@ static int ads1256_probe(struct spi_device *spi) {
     data->last_sample.timestamp = 0;                    // Default timestamp
     data->data_rate = ADS1256_DRATE_SPS_30000;          // Default value
     data->pga_gain = ADS1256_ADCON_PGA_1;               // Default value
-    data->sampling_active = false;  // Add this line after other initializations
+    data->sampling_active = false;
     spi_set_drvdata(spi, data);
 
     // DRDY GPIO setup
@@ -1013,18 +1049,23 @@ static int ads1256_probe(struct spi_device *spi) {
         dev_info(&spi->dev, "Class created: %p\n", ads1256_class);
     }
 
-    data->devt = MKDEV(ads1256_major, bus_num);
+    // Assign unique minor number
+    spin_lock(&device_list_lock);
+    data->dev_minor = atomic_read(&ads1256_device_count);  // Use device count as minor
+    data->devt = MKDEV(ads1256_major, data->dev_minor);
+    spin_unlock(&device_list_lock);
+
     cdev_init(&data->cdev, &ads1256_fops);
     data->cdev.owner = THIS_MODULE;
     ret = cdev_add(&data->cdev, data->devt, 1);
     if (ret) {
-        dev_err(&spi->dev, "Failed to add cdev for SPI%d: %d\n", bus_num, ret);
+        dev_err(&spi->dev, "Failed to add cdev for SPI%d CS%d: %d\n", bus_num, spi->chip_select, ret);
         goto err_cdev;
     }
-    dev_info(&spi->dev, "cdev added: major=%d, minor=0, ret=%d\n", ads1256_major, ret);
+    dev_info(&spi->dev, "cdev added: major=%d, minor=%d\n", ads1256_major, data->dev_minor);
 
-    // Create device node (e.g., /dev/ads1256_0, /dev/ads1256_3)
-    snprintf(dev_name, sizeof(dev_name), "ads1256_%d", bus_num);
+    // Create device node (e.g., /dev/ads1256_0.0, /dev/ads1256_0.1)
+    snprintf(dev_name, sizeof(dev_name), "ads1256_%d.%d", bus_num, spi->chip_select);
     data->device = device_create(ads1256_class, &spi->dev, data->devt, data, dev_name);
     if (IS_ERR(data->device)) {
         ret = PTR_ERR(data->device);
@@ -1082,16 +1123,19 @@ static int ads1256_probe(struct spi_device *spi) {
     // Register this device in the global list
     spin_lock(&device_list_lock);
     switch (bus_num) {
-    case 0: device_index = 0; break;
-    case 3: device_index = 1; break;
-    case 4: device_index = 2; break;
-    case 5: device_index = 3; break;
-    case 6: device_index = 4; break;
-    default: device_index = -1; break;  // Should never happen due to earlier check
+        case 0: device_index = 0; break;
+        case 3: device_index = 1; break;
+        case 4: device_index = 2; break;
+        case 5: device_index = 3; break;
+        case 6: device_index = 4; break;
+        default: device_index = -1; break;  // Should never happen due to earlier check
     }
+    // Note: We no longer overwrite slots, so this is simplified
     if (device_index >= 0 && device_index < MAX_ADS1256_DEVICES) {
-        ads1256_devices[device_index] = data;
+        // Array now just tracks presence, not uniqueness
+        ads1256_devices[device_index] = data;  // Overwrites if multiple CS, but sync_all will handle all
     }
+    atomic_inc(&ads1256_device_count);  // Increment count for each device
     spin_unlock(&device_list_lock);
 
     // Sync all devices now that a new one is added
@@ -1107,9 +1151,8 @@ static int ads1256_probe(struct spi_device *spi) {
         mod_delayed_work(system_wq, &sync_work, msecs_to_jiffies(SYNC_TIMEOUT_MS));
     }
 
-    dev_info(&spi->dev, "ADS1256 on SPI%d initialized, device %s created\n", bus_num, dev_name);
+    dev_info(&spi->dev, "ADS1256 on SPI%d CS%d initialized, device %s created\n", bus_num, spi->chip_select, dev_name);
     kobject_uevent(&data->device->kobj, KOBJ_ADD);
-    atomic_inc(&ads1256_device_count);  // Add this line to track active devices
     return 0;
 
 err_init:
@@ -1118,7 +1161,11 @@ err_init:
         device_remove_file(data->device, &dev_attr_calibrate);
     if (data->sysfs_last_sample)
         device_remove_file(data->device, &dev_attr_last_sample);
-    device_remove_file(data->device, &dev_attr_current_sample);
+    device_remove_file(data->device, &dev_attr_data_rate);
+    device_remove_file(data->device, &dev_attr_pga_gain);
+    // Only remove current_sample if it was created
+    if (device_create_file(data->device, &dev_attr_current_sample) == 0)
+        device_remove_file(data->device, &dev_attr_current_sample);
     device_destroy(ads1256_class, data->devt);
 err_device:
     cdev_del(&data->cdev);
@@ -1167,16 +1214,16 @@ static int ads1256_remove(struct spi_device *spi) {
 
         // Remove from device list
         spin_lock(&device_list_lock);
-        switch (data->dev_num) {
-        case 0: device_index = 0; break;
-        case 3: device_index = 1; break;
-        case 4: device_index = 2; break;
-        case 5: device_index = 3; break;
-        case 6: device_index = 4; break;
-        default: device_index = -1; break;
+        switch (data->bus_num) {
+            case 0: device_index = 0; break;
+            case 3: device_index = 1; break;
+            case 4: device_index = 2; break;
+            case 5: device_index = 3; break;
+            case 6: device_index = 4; break;
+            default: device_index = -1; break;
         }
-        if (device_index >= 0 && device_index < MAX_ADS1256_DEVICES) {
-            ads1256_devices[device_index] = NULL;
+        if (device_index >= 0 && device_index < MAX_ADS1256_DEVICES && ads1256_devices[device_index] == data) {
+            ads1256_devices[device_index] = NULL;  // Clear only if it’s this instance
         }
         atomic_dec(&ads1256_device_count);
         if (atomic_read(&ads1256_device_count) == 0 && shared_sync_gpio) {
@@ -1184,7 +1231,7 @@ static int ads1256_remove(struct spi_device *spi) {
         }
         spin_unlock(&device_list_lock);
 
-        dev_info(&spi->dev, "ADS1256 on SPI%d removed\n", data->dev_num);
+        dev_info(&spi->dev, "ADS1256 on SPI%d CS%d removed\n", data->bus_num, data->cs_num);
     }
     spi_set_drvdata(spi, NULL);
     return 0;
